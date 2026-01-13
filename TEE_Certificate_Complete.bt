@@ -1,0 +1,2453 @@
+//------------------------------------------------
+//  010 Editor v14.0 二进制模板
+//
+//  文件: TEE_Certificate.bt
+//  作者: lxz
+//  版本: 4.1
+//  用途: 解析 Android TEE 密钥认证证书 完整的 X.509 证书结构 + TEE 扩展
+//  类别: 证书
+//  文件掩码: *.bin;*.cert
+//  标识字节: 30 82 //ASN.1 SEQUENCE
+//
+// 参考资料:
+//  https://source.android.com/docs/security/features/keystore/attestation
+//  https://developer.android.com/training/articles/security-key-attestation
+//  https://github.com/vvb2060/KeyAttestation.git
+//
+// 重要提示:
+//  1. ReadByte() vs ReadUByte():
+//     - ReadByte() 返回有符号字符 (-128 到 127)
+//     - ReadUByte() 返回无符号字符 (0 到 255)
+//     - 对于十六进制值 > 0x7F (127) 的情况，必须使用 ReadUByte()
+//     - 示例: 0xA3 = 163 (无符号)，但 ReadByte() 返回 -93 (符号扩展为 0xFFFFFFA3)
+//
+//  2. 循环中的变量作用域:
+//     - 在循环外部声明循环变量，避免重复声明错误
+//     - 对于嵌套结构，使用全局循环计数器 (g_i, g_j)
+//
+//  3. ASN.1 长度解析:
+//     - 短格式: len < 128，编码在 1 个字节中
+//     - 长格式: len >= 128，第一个字节 = 0x80 | 长度字节数
+//     - 始终检查 (first_byte & 0x80) 来区分格式
+//------------------------------------------------
+
+RequiresVersion( 14 );
+
+BigEndian();
+
+//--------------------------------------
+// 全局变量
+//--------------------------------------
+
+local int g_warnings = 0;        // 警告计数器，记录解析过程中遇到的警告数量
+local string g_temp_warning;     // 临时警告消息缓冲区
+local int g_i;                   // 全局循环计数器 i，用于嵌套结构
+local int g_j;                   // 全局循环计数器 j，用于嵌套结构
+
+//--------------------------------------
+// ASN.1 标签常量
+//--------------------------------------
+
+#define ASN1_BOOLEAN              0x01
+#define ASN1_INTEGER              0x02
+#define ASN1_BIT_STRING           0x03
+#define ASN1_OCTET_STRING         0x04
+#define ASN1_NULL                 0x05
+#define ASN1_OBJECT_IDENTIFIER    0x06
+#define ASN1_ENUMERATED           0x0A
+#define ASN1_UTF8_STRING          0x0C
+#define ASN1_PRINTABLE_STRING     0x13
+#define ASN1_IA5_STRING           0x16
+#define ASN1_UTC_TIME             0x17
+#define ASN1_GENERALIZED_TIME     0x18
+#define ASN1_SEQUENCE             0x30
+#define ASN1_SET                  0x31
+#define ASN1_CONTEXT_0            0xA0
+#define ASN1_CONTEXT_3            0xA3
+#define ASN1_CONTEXT_31           0xBF
+
+//--------------------------------------
+// Keymaster 标签常量
+//--------------------------------------
+// 这些常量定义了 Android Keymaster 硬件抽象层 (HAL) 中使用的各种标签
+// 标签号用于标识密钥属性和认证信息的不同类型
+
+#define KM_TAG_PURPOSE                         1
+#define KM_TAG_ALGORITHM                       2
+#define KM_TAG_KEY_SIZE                        3
+#define KM_TAG_DIGEST                          5
+#define KM_TAG_PADDING                         6
+#define KM_TAG_EC_CURVE                        10
+#define KM_TAG_RSA_PUBLIC_EXPONENT             200
+#define KM_TAG_ORIGIN                          702
+#define KM_TAG_ROOT_OF_TRUST                   704
+#define KM_TAG_OS_VERSION                      705
+#define KM_TAG_OS_PATCHLEVEL                   706
+#define KM_TAG_ATTESTATION_ID_BRAND            710
+#define KM_TAG_ATTESTATION_ID_DEVICE           711
+#define KM_TAG_ATTESTATION_ID_PRODUCT          712
+#define KM_TAG_ATTESTATION_ID_SERIAL           713
+#define KM_TAG_ATTESTATION_ID_IMEI             714
+#define KM_TAG_ATTESTATION_ID_MANUFACTURER     716
+#define KM_TAG_ATTESTATION_ID_MODEL            717
+#define KM_TAG_VENDOR_PATCHLEVEL               718
+#define KM_TAG_BOOT_PATCHLEVEL                 719
+
+//--------------------------------------
+// 枚举类型定义
+//--------------------------------------
+
+// 已验证启动状态枚举
+// 表示 Android 设备的启动验证状态，用于评估设备的安全状态
+typedef enum <uchar> {
+    VERIFIED_BOOT_VERIFIED    = 0,  // 已验证：启动镜像已通过验证
+    VERIFIED_BOOT_SELF_SIGNED = 1,  // 自签名：启动镜像使用自签名证书
+    VERIFIED_BOOT_UNVERIFIED  = 2,  // 未验证：启动镜像未通过验证
+    VERIFIED_BOOT_FAILED      = 3   // 验证失败：启动验证过程失败
+} VerifiedBootState;
+
+// 安全级别枚举
+// 表示密钥存储和操作的安全执行环境
+typedef enum <uchar> {
+    SECURITY_LEVEL_SOFTWARE   = 0,  // 软件级别：在普通 Android 系统中执行
+    SECURITY_LEVEL_TEE        = 1,  // TEE 级别：在可信执行环境中执行
+    SECURITY_LEVEL_STRONGBOX  = 2   // StrongBox 级别：在独立的硬件安全模块中执行
+} SecurityLevel;
+
+// 密钥来源枚举
+// 表示密钥是如何创建或获取的
+typedef enum <uchar> {
+    KM_ORIGIN_GENERATED       = 0,  // 生成：在设备上生成
+    KM_ORIGIN_DERIVED         = 1,  // 派生：从其他密钥派生而来
+    KM_ORIGIN_IMPORTED        = 2,  // 导入：从外部导入（未加密）
+    KM_ORIGIN_UNKNOWN         = 3,  // 未知：来源未知
+    KM_ORIGIN_SECURELY_IMPORTED = 4 // 安全导入：从外部导入（已加密）
+} KeyOrigin;
+
+//--------------------------------------
+// 辅助函数
+//--------------------------------------
+
+// 重要提示：当比较字节值 > 127 (0x80-0xFF) 时:
+// - ReadByte() 返回有符号字符 (-128 到 127)，会导致符号扩展
+// - ReadUByte() 返回无符号字符 (0 到 255)，对十六进制值是正确的
+// 示例: 0xA3 = 163 (无符号)，但 -93 (有符号)
+//       ReadByte() 返回 -93，比较时会变成 0xFFFFFFA3
+//       ReadUByte() 返回 163，正确匹配 0xA3
+// 经验法则：当与十六进制值 > 0x7F 比较时，始终使用 ReadUByte()
+
+// 函数名: PrintWarning
+// 功能: 打印警告消息并增加警告计数器
+// 参数:
+//   - message: 要打印的警告消息字符串
+// 返回值: 无
+// 说明: 将警告消息格式化后输出，并更新全局警告计数器
+void PrintWarning(string message) {
+    Warning(g_temp_warning);
+    SPrintf(g_temp_warning, "%s\n", message);
+    Printf(g_temp_warning);
+    g_warnings++;
+}
+
+// 函数名: ParseNestedAsn1Tags
+// 功能: 递归解析嵌套的 ASN.1 标签（辅助函数，用于理解结构深度）
+// 参数:
+//   - start_pos: 开始解析的文件位置（字节偏移）
+//   - end_pos: 结束解析的文件位置（字节偏移）
+//   - depth: 当前递归深度
+//   - max_depth: 最大允许的递归深度，防止无限递归
+// 返回值:
+//   - 成功: 返回解析的标签数量
+//   - 错误: 返回 -1
+//   - 达到深度限制: 返回 0
+// 说明: 这是一个辅助函数，主要用于调试和理解 ASN.1 结构的嵌套深度
+//      实际解析工作由主解析器 ASN1_TAG 结构完成
+int ParseNestedAsn1Tags(int64 start_pos, int64 end_pos, int depth, int max_depth) {
+    // 检查是否达到最大递归深度
+    if (depth >= max_depth) {
+        Printf("%*s[Depth limit reached]\n", depth*2, "");
+        return 0;
+    }
+    
+    local int64 pos = start_pos;
+    local int tag_count = 0;
+    
+    // 在指定范围内解析标签
+    while (pos < end_pos && pos < FileSize() && tag_count < 50) {
+        FSeek(pos);
+        local uchar tag = ReadUByte(pos);
+        local int is_constructed = (tag & 0x20) != 0;  // 检查是否为构造类型（第6位为1）
+        
+        // 打印标签信息（用于调试）
+        Printf("%*sTag 0x%02X at 0x%X (%s)\n", depth*2, "", tag, pos, is_constructed ? "CONSTRUCTED" : "PRIMITIVE");
+        
+        // 返回，让主解析器处理实际的解析工作
+        // 这是一个辅助函数，用于理解结构深度
+        return tag_count;
+    }
+    
+    return tag_count;
+}
+
+// 函数名: ReadAsn1Length
+// 功能: 从指定位置读取 ASN.1 编码的长度值
+// 参数:
+//   - pos: 要读取长度的文件位置（字节偏移）
+// 返回值:
+//   - 成功: 返回长度值（字节数）
+//   - 错误: 返回 -1（位置超出文件大小、格式错误等）
+// 说明: ASN.1 长度编码有两种格式：
+//       1. 短格式：长度 < 128，直接编码在 1 个字节中
+//       2. 长格式：长度 >= 128，第一个字节 = 0x80 | 后续长度字节数
+//       通过检查第一个字节的最高位 (0x80) 来区分格式
+int ReadAsn1Length(int64 pos) {
+    // 检查位置是否有效
+    if (pos >= FileSize()) return -1;
+    
+    local uchar first_byte = ReadByte(pos);
+    // 短格式：最高位为 0，长度直接编码在第一个字节中
+    if ((first_byte & 0x80) == 0) {
+        return first_byte;
+    }
+    
+    // 长格式：最高位为 1，低 7 位表示后续长度字节数
+    local int num_bytes = first_byte & 0x7F;
+    // 验证长度字节数（最多 4 字节，支持最大 2^32-1 的长度）
+    if (num_bytes == 0 || num_bytes > 4) return -1;
+    
+    // 读取后续字节并组合成长度值（大端序）
+    local int length = 0;
+    for (g_i = 0; g_i < num_bytes; g_i++) {
+        if (pos + 1 + g_i >= FileSize()) return -1;
+        length = (length << 8) | ReadByte(pos + 1 + g_i);  // 左移 8 位后或运算
+    }
+    return length;
+}
+
+// 函数名: SecurityLevelToString
+// 功能: 将安全级别枚举值转换为可读的字符串
+// 参数:
+//   - level: SecurityLevel 枚举值（0=软件, 1=TEE, 2=StrongBox）
+// 返回值: 对应的字符串描述
+// 说明: 用于在界面中显示密钥的安全执行环境
+string SecurityLevelToString(SecurityLevel level) {
+    switch(level) {
+        case 0: return "Software";
+        case 1: return "TEE";
+        case 2: return "StrongBox";
+        default: return "Unknown";
+    }
+}
+
+// 函数名: BootStateToString
+// 功能: 将启动验证状态枚举值转换为可读的字符串
+// 参数:
+//   - state: VerifiedBootState 枚举值（0=已验证, 1=自签名, 2=未验证, 3=失败）
+// 返回值: 对应的字符串描述
+// 说明: 用于在界面中显示设备的启动验证状态
+string BootStateToString(VerifiedBootState state) {
+    switch(state) {
+        case 0: return "Verified";
+        case 1: return "Self-Signed";
+        case 2: return "Unverified";
+        case 3: return "Failed";
+        default: return "Unknown";
+    }
+}
+
+// 函数名: GetKeymasterTagName
+// 功能: 根据 Keymaster 标签号返回对应的标签名称
+// 参数:
+//   - tag: Keymaster 标签号（只使用标签号，不包含类型位）
+// 返回值: 标签名称字符串，如果未找到则返回 "TAG_<标签号>"
+// 说明: Keymaster 标签用于标识密钥属性和认证信息
+//       标签号范围从 1 到 724，涵盖密钥用途、算法、设备信息等各个方面
+string GetKeymasterTagName(int tag) {
+    switch(tag) {
+        // Keymaster 标签（只使用标签号，不包含类型位）
+        case 1: return "PURPOSE";                              // 密钥用途（加密/签名/验证等）
+        case 2: return "ALGORITHM";                            // 加密算法（RSA/EC/AES等）
+        case 3: return "KEY_SIZE";                             // 密钥大小（位数）
+        case 4: return "BLOCK_MODE";                           // 分组加密模式（ECB/CBC/CTR/GCM等）
+        case 5: return "DIGEST";                               // 摘要算法（SHA256/SHA512等）
+        case 6: return "PADDING";                              // 填充模式（PKCS7/OAEP/PSS等）
+        case 7: return "CALLER_NONCE";                         // 允许调用者提供随机数
+        case 8: return "MIN_MAC_LENGTH";                       // 最小MAC长度（认证标签）
+        case 9: return "KDF";                                  // 密钥派生函数
+        case 10: return "EC_CURVE";                            // 椭圆曲线类型（P-256/P-384等）
+        case 200: return "RSA_PUBLIC_EXPONENT";                // RSA公钥指数（通常是65537）
+        case 203: return "RSA_OAEP_MGF_DIGEST";                // RSA OAEP的MGF摘要算法
+        case 303: return "ROLLBACK_RESISTANCE";                // 防回滚保护（密钥版本控制）
+        case 305: return "EARLY_BOOT_ONLY";                    // 仅在早期启动时可用
+        case 400: return "ACTIVE_DATETIME";                    // 密钥激活时间（之前不可用）
+        case 401: return "ORIGINATION_EXPIRE_DATETIME";        // 加密操作过期时间
+        case 402: return "USAGE_EXPIRE_DATETIME";              // 解密操作过期时间
+        case 405: return "USAGE_COUNT_LIMIT";                  // 密钥使用次数限制
+        case 503: return "NO_AUTH_REQUIRED";                   // 不需要用户认证
+        case 504: return "USER_AUTH_TYPE";                     // 用户认证类型（密码/指纹/面部）
+        case 505: return "AUTH_TIMEOUT";                       // 认证超时时间（秒）
+        case 506: return "ALLOW_WHILE_ON_BODY";                // 允许在身体佩戴时使用
+        case 507: return "TRUSTED_USER_PRESENCE_REQUIRED";     // 需要可信用户在场确认
+        case 508: return "TRUSTED_CONFIRMATION_REQUIRED";      // 需要用户明确确认操作
+        case 509: return "UNLOCKED_DEVICE_REQUIRED";           // 需要设备解锁状态
+        case 600: return "ALL_APPLICATIONS";                   // 所有应用可用
+        case 601: return "APPLICATION_ID";                     // 限制使用的应用ID
+        case 701: return "CREATION_DATETIME";                  // 密钥创建时间（可推断重置时间）
+        case 702: return "ORIGIN";                             // 密钥来源（生成/导入/派生）
+        case 703: return "ROLLBACK_RESISTANT";                 // 具有防回滚能力
+        case 704: return "ROOT_OF_TRUST";                      // 信任根（启动验证状态）
+        case 705: return "OS_VERSION";                         // 操作系统版本号
+        case 706: return "OS_PATCHLEVEL";                      // 系统安全补丁级别（YYYYMM）
+        case 709: return "ATTESTATION_APPLICATION_ID";         // 请求认证的应用信息
+        case 710: return "ATTESTATION_ID_BRAND";               // 设备品牌（华为/小米/OPPO等）
+        case 711: return "ATTESTATION_ID_DEVICE";              // 设备型号代码
+        case 712: return "ATTESTATION_ID_PRODUCT";             // 产品名称
+        case 713: return "ATTESTATION_ID_SERIAL";              // 设备序列号
+        case 714: return "ATTESTATION_ID_IMEI";                // IMEI号（国际移动设备识别码）
+        case 715: return "ATTESTATION_ID_MEID";                // MEID号（移动设备识别码）
+        case 716: return "ATTESTATION_ID_MANUFACTURER";        // 制造商名称
+        case 717: return "ATTESTATION_ID_MODEL";               // 设备型号名称
+        case 718: return "VENDOR_PATCHLEVEL";                  // 厂商补丁级别（YYYYMMDD）
+        case 719: return "BOOT_PATCHLEVEL";                    // 启动镜像补丁级别（YYYYMMDD）
+        case 720: return "DEVICE_UNIQUE_ATTESTATION";          // 使用设备唯一密钥认证
+        case 721: return "IDENTITY_CREDENTIAL_KEY";            // 身份凭证密钥
+        case 723: return "ATTESTATION_ID_SECOND_IMEI";         // 第二个IMEI号（双卡手机）
+        case 724: return "MODULE_HASH";                        // TEE模块哈希值
+        default: {
+    local string s;
+            SPrintf(s, "TAG_%d", tag);
+    return s;
+}
+    }
+}
+
+//--------------------------------------
+// ASN.1 长度读取结构
+//--------------------------------------
+
+// 结构名: ASN1_LENGTH
+// 功能: 解析 ASN.1 编码的长度字段
+// 说明: ASN.1 长度编码有两种格式：
+//       1. 短格式：长度 < 128，直接编码在 1 个字节中（最高位为 0）
+//       2. 长格式：长度 >= 128，第一个字节 = 0x80 | 后续长度字节数（最高位为 1）
+//       通过检查第一个字节的最高位 (0x80) 来区分格式
+typedef struct {
+    uchar first_byte <format=hex, comment="长度指示字节：最高位(0x80)用于区分短格式(0)和长格式(1)，低7位在长格式中表示后续长度字节数">;
+    
+    local int actual_length = 0;  // 实际长度值（字节数）
+    local int extra_bytes = 0;    // 长格式中后续长度字节数（0 表示短格式）
+    
+    // 判断是短格式还是长格式
+    if ((first_byte & 0x80) == 0) {
+        // 短格式：长度直接编码在第一个字节中
+        actual_length = first_byte;
+    } else {
+        // 长格式：第一个字节的低 7 位表示后续长度字节数
+        extra_bytes = first_byte & 0x7F;
+        if (extra_bytes > 0 && extra_bytes <= 4) {
+            uchar length_bytes[extra_bytes] <format=hex, comment="长度值字节：大端序编码的实际长度值，最多4字节，支持最大2^32-1的长度">;
+            // 读取后续字节并组合成长度值（大端序）
+            for (g_i = 0; g_i < extra_bytes; g_i++) {
+                actual_length = (actual_length << 8) | length_bytes[g_i];
+            }
+        }
+    }
+} ASN1_LENGTH <read=ReadAsn1LengthStruct>;
+
+// 函数名: ReadAsn1LengthStruct
+// 功能: 格式化显示 ASN1_LENGTH 结构的内容
+// 参数:
+//   - len: ASN1_LENGTH 结构的引用
+// 返回值: 格式化的字符串，显示长度值和编码格式
+// 说明: 用于在 010 Editor 界面中显示长度信息
+string ReadAsn1LengthStruct(ASN1_LENGTH &len) {
+    local string s;
+    if (len.extra_bytes == 0) {
+        // 短格式：只显示长度值
+        SPrintf(s, "%d bytes", len.actual_length);
+    } else {
+        // 长格式：显示长度值和编码字节数
+        SPrintf(s, "%d bytes (%d-byte length)", len.actual_length, len.extra_bytes);
+    }
+    return s;
+}
+
+//--------------------------------------
+// 认证包信息结构
+//--------------------------------------
+
+// 结构名: ATTESTATION_PACKAGE_INFO
+// 功能: 解析认证应用包信息（包名和版本号）
+// 说明: 这个结构包含在 AttestationApplicationId 中，用于标识请求认证的应用
+//       包含应用包名（OCTET STRING）和版本号（INTEGER）
+//       根据 ASN.1 定义：
+//       AttestationPackageInfo ::= SEQUENCE {
+//           packageName  OCTET STRING,
+//           version      INTEGER
+//       }
+typedef struct {
+    local int64 pkg_start = FTell();
+    
+    // SEQUENCE tag and length
+    uchar seq_tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：表示这是一个有序序列结构">;
+    ASN1_LENGTH seq_length <comment="SEQUENCE长度：整个包信息结构的字节数">;
+    local int64 seq_end = FTell() + seq_length.actual_length;
+    
+    // 包名 (OCTET STRING)
+    uchar name_tag <format=hex, hidden=true, comment="OCTET STRING标签(0x04)：表示后续是字节串类型">;
+    ASN1_LENGTH name_length <comment="包名长度：应用包名的字节数，通常为UTF-8编码的字符串">;
+    
+    // 声明在外层使其可见（用于后续访问）
+    local string package_name_str = "";
+    local uint32 version_code = 0;
+    
+    if (name_length.actual_length > 0 && name_length.actual_length < 200) {
+        char package_name[name_length.actual_length] <comment="应用包名：UTF-8编码的字符串，例如com.example.app">;
+        // 转换为字符串用于显示
+        local int i;
+        for (i = 0; i < name_length.actual_length; i++) {
+            package_name_str += package_name[i];
+        }
+    }
+    
+    // 版本号 (INTEGER)
+    uchar ver_tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：表示后续是整数类型">;
+    ASN1_LENGTH ver_length <comment="版本号长度：版本号整数的字节数，通常1-4字节">;
+    
+    // 根据版本号长度读取不同大小的整数（1、2、3 或 4 字节）
+    // INTEGER 使用 DER 编码，可能是 1-4 字节
+    if (ver_length.actual_length == 1) {
+        uchar ver_val <comment="版本号：1字节整数，表示应用的版本代码(versionCode)">;
+        version_code = ver_val;
+    } else if (ver_length.actual_length == 2) {
+        uint16 ver_val <comment="版本号：2字节整数，表示应用的版本代码(versionCode)">;
+        version_code = ver_val;
+    } else if (ver_length.actual_length == 3) {
+        // 3字节整数，需要手动读取
+        uchar ver_bytes[3] <hidden=true>;
+        version_code = (ver_bytes[0] << 16) | (ver_bytes[1] << 8) | ver_bytes[2];
+    } else if (ver_length.actual_length == 4) {
+        uint32 ver_val <comment="版本号：4字节整数，表示应用的版本代码(versionCode)，大端序">;
+        version_code = ver_val;
+    } else if (ver_length.actual_length > 4) {
+        // 处理大于4字节的整数（很少见，但可能）
+        uchar ver_bytes[ver_length.actual_length] <format=hex, comment="版本号：大于4字节的整数（罕见情况），大端序编码">;
+        version_code = 0;  // 太大，不解析
+    }
+    
+    // 读取 SEQUENCE 中任何剩余的字节
+    if (FTell() < seq_end) {
+        local int remaining = seq_end - FTell();
+        if (remaining > 0) {
+            uchar pkg_remaining[remaining] <format=hex, hidden=true>;
+        }
+    }
+} ATTESTATION_PACKAGE_INFO <read=ReadPackageInfo, style=sData>;
+
+// 函数名: ReadPackageInfo
+// 功能: 格式化显示认证包信息
+// 参数:
+//   - info: ATTESTATION_PACKAGE_INFO 结构的引用
+// 返回值: 格式化的字符串，显示包名和版本号
+// 说明: 用于在 010 Editor 界面中显示应用包信息
+string ReadPackageInfo(ATTESTATION_PACKAGE_INFO &info) {
+    local string s;
+    if (info.package_name_str != "") {
+        SPrintf(s, "%s (v%d)", info.package_name_str, info.version_code);
+    } else {
+        SPrintf(s, "v%d", info.version_code);
+    }
+    return s;
+}
+
+//--------------------------------------
+// 签名摘要结构
+//--------------------------------------
+
+// 结构名: SIGNATURE_DIGEST
+// 功能: 解析签名摘要（SHA-256）
+// 说明: 这是 APK 签名证书的 SHA-256 摘要，用于验证应用身份
+typedef struct {
+    uchar tag <format=hex, hidden=true, comment="OCTET STRING标签(0x04)：表示后续是字节串类型">;
+    ASN1_LENGTH length <comment="摘要长度：签名摘要的字节数，通常为32字节(SHA-256)">;
+    
+    local string digest_hex = "";
+    
+    if (length.actual_length > 0 && length.actual_length <= 64) {
+        uchar digest[length.actual_length] <format=hex, comment="签名摘要：APK签名证书的SHA-256哈希值，32字节，用于验证应用身份和完整性">;
+        
+        // 生成十六进制字符串用于显示
+        local int i;
+        local int high;  // 在循环外部声明，避免重复声明错误
+        local int low;   // 在循环外部声明，避免重复声明错误
+        local string hex_chars = "0123456789ABCDEF";
+        for (i = 0; i < length.actual_length; i++) {
+            high = (digest[i] >> 4) & 0x0F;
+            low = digest[i] & 0x0F;
+            digest_hex += hex_chars[high];
+            digest_hex += hex_chars[low];
+        }
+    }
+} SIGNATURE_DIGEST <read=ReadSignatureDigest, style=sData>;
+
+// 函数名: ReadSignatureDigest
+// 功能: 格式化显示签名摘要
+// 参数:
+//   - sig: SIGNATURE_DIGEST 结构的引用
+// 返回值: 格式化的字符串，显示 SHA-256 摘要
+string ReadSignatureDigest(SIGNATURE_DIGEST &sig) {
+    local string s;
+    if (sig.length.actual_length == 32) {
+        SPrintf(s, "SHA-256: %s", sig.digest_hex);
+    } else {
+        SPrintf(s, "Digest: %d bytes", sig.length.actual_length);
+    }
+    return s;
+}
+
+//--------------------------------------
+// 认证应用 ID 结构
+//--------------------------------------
+// 说明: 这是从 Application[99] PRIMITIVE 标签中解析出来的
+//       根据 ASN.1 定义：
+//       AttestationApplicationId ::= SEQUENCE {
+//           packageInfos    SET OF AttestationPackageInfo,
+//           signatureDigests SET OF OCTET STRING
+//       }
+//       注意：SET OF 的顺序不保证，可能先出现 packageInfos 或 signatureDigests
+//       外层可能被 OCTET STRING (0x04) 包装
+
+// 结构名: ATTESTATION_APPLICATION_ID
+// 功能: 解析认证应用 ID，包含应用包信息和签名摘要
+// 说明: 用于标识请求密钥认证的应用，包含应用的包名、版本号和签名摘要
+//       这些信息用于验证应用的身份和完整性，TEE 侧不可伪造
+typedef struct {
+    local int64 start_pos = FTell();
+    Printf("    [ATTESTATION_APPLICATION_ID] Starting at 0x%X\n", start_pos);
+    
+    // 检查是否被 OCTET STRING 包装（常见情况）
+    local uchar peek_tag = ReadUByte(FTell());
+    local int has_outer_octet = 0;
+    
+    if (peek_tag == ASN1_OCTET_STRING) {
+        has_outer_octet = 1;
+        Printf("    [ATTESTATION_APPLICATION_ID] Found outer OCTET STRING wrapper\n");
+        uchar outer_tag <format=hex, hidden=true, comment="外层OCTET STRING标签(0x04)：某些情况下认证应用ID会被OCTET STRING包装">;
+        ASN1_LENGTH outer_length <name="外层OCTET STRING长度", comment="外层包装长度：包含整个认证应用ID结构的字节数">;
+        Printf("    [ATTESTATION_APPLICATION_ID] Outer wrapper: %d bytes\n", outer_length.actual_length);
+    }
+    
+    // 核心 SEQUENCE (AttestationApplicationId)
+    uchar seq_tag <format=hex, comment="SEQUENCE标签(0x30)：认证应用ID的核心序列结构", hidden=true>;
+    ASN1_LENGTH seq_length <comment="SEQUENCE长度：包含包信息集合和签名摘要集合的总字节数">;
+    local int64 seq_end = FTell() + seq_length.actual_length;
+    
+    Printf("    [ATTESTATION_APPLICATION_ID] SEQUENCE: %d bytes (0x%X to 0x%X)\n", 
+           seq_length.actual_length, FTell(), seq_end);
+    
+    // 声明变量用于跟踪解析结果
+    local int pkg_count = 0;
+    local int sig_count = 0;
+    local int64 seq_data_start = FTell();
+    local int64 elem_start;      // 在循环外部声明，避免重复声明错误
+    local uchar elem_tag;         // 在循环外部声明，避免重复声明错误
+    local int64 set_end;          // 在循环外部声明，避免重复声明错误
+    local int64 peek_pos;         // 在循环外部声明，避免重复声明错误
+    local uchar first_elem_tag;   // 在循环外部声明，避免重复声明错误
+    local int64 pkg_set_start;    // 在循环外部声明，避免重复声明错误
+    local int64 sig_set_start;    // 在循环外部声明，避免重复声明错误
+    
+    // 解析 SEQUENCE 中的元素（可能是 packageInfos 或 signatureDigests，顺序不保证）
+    while (FTell() < seq_end && FTell() < FileSize() && (pkg_count + sig_count) < 30) {
+        elem_start = FTell();
+        elem_tag = ReadUByte(elem_start);
+        
+        // SET tag = 0x31
+        if (elem_tag == ASN1_SET) {
+            uchar set_tag <format=hex, hidden=true, comment="SET标签(0x31)：表示无序集合，可能包含包信息集合或签名摘要集合">;
+            ASN1_LENGTH set_length <comment="SET长度：集合中所有元素的字节数">;
+            set_end = FTell() + set_length.actual_length;
+            
+            // 检查 SET 的内容类型：通过查看第一个元素来判断
+            peek_pos = FTell();
+            if (peek_pos < set_end && peek_pos < FileSize()) {
+                first_elem_tag = ReadUByte(peek_pos);
+                
+                if (first_elem_tag == ASN1_SEQUENCE) {
+                    // 这是 packageInfos SET
+                    Printf("      [SET] Package Infos: %d bytes\n", set_length.actual_length);
+                    pkg_set_start = FTell();
+                    
+                    while (FTell() < set_end && FTell() < FileSize() && pkg_count < 20) {
+                        ATTESTATION_PACKAGE_INFO package_info <name="Package Info">;
+                        pkg_count++;
+                        
+                        // 安全检查
+                        if (FTell() >= set_end) break;
+                        if (FTell() <= pkg_set_start) {
+                            Printf("      [WARNING] Package parsing didn't advance, stopping\n");
+                            break;
+                        }
+                        pkg_set_start = FTell();
+                    }
+                } else if (first_elem_tag == ASN1_OCTET_STRING) {
+                    // 这是 signatureDigests SET
+                    Printf("      [SET] Signature Digests: %d bytes\n", set_length.actual_length);
+                    sig_set_start = FTell();
+                    
+                    while (FTell() < set_end && FTell() < FileSize() && sig_count < 10) {
+                        SIGNATURE_DIGEST signature_digest <name="Signature Digest">;
+                        sig_count++;
+                        
+                        // 安全检查
+                        if (FTell() >= set_end) break;
+                        if (FTell() <= sig_set_start) {
+                            Printf("      [WARNING] Signature parsing didn't advance, stopping\n");
+                            break;
+                        }
+                        sig_set_start = FTell();
+                    }
+                } else {
+                    // 未知的 SET 内容，跳过
+                    Printf("      [SET] Unknown content (tag=0x%02X), skipping %d bytes\n", 
+                           first_elem_tag, set_length.actual_length);
+                    if (set_length.actual_length > 0 && set_length.actual_length < 10000) {
+                        uchar unknown_set_data[set_length.actual_length] <format=hex, hidden=true>;
+                    } else {
+                        FSeek(set_end);
+                    }
+                }
+            }
+        } else {
+            // 不是 SET，可能是其他结构，跳过
+            Printf("      [WARNING] Unexpected tag 0x%02X at 0x%X, skipping\n", elem_tag, elem_start);
+            break;
+        }
+    }
+    
+    // 读取 SEQUENCE 中任何剩余的字节
+    if (FTell() < seq_end) {
+        local int remaining = seq_end - FTell();
+        if (remaining > 0) {
+            Printf("    [ATTESTATION_APPLICATION_ID] %d bytes remaining in SEQUENCE\n", remaining);
+            if (remaining < 100) {
+                uchar remaining_bytes[remaining] <format=hex, hidden=true>;
+            } else {
+                FSeek(seq_end);
+            }
+        }
+    }
+    
+    Printf("    [ATTESTATION_APPLICATION_ID] Complete: %d package(s), %d signature(s)\n", 
+           pkg_count, sig_count);
+    
+} ATTESTATION_APPLICATION_ID <read=ReadAppId, style=sSection1>;
+
+// 函数名: ReadAppId
+// 功能: 格式化显示认证应用 ID 信息
+// 参数:
+//   - appid: ATTESTATION_APPLICATION_ID 结构的引用
+// 返回值: 格式化的字符串，显示包数量和签名数量
+// 说明: 用于在 010 Editor 界面中显示应用认证信息摘要
+string ReadAppId(ATTESTATION_APPLICATION_ID &appid) {
+    local string s;
+    SPrintf(s, "%d package(s), %d signature(s)", appid.pkg_count, appid.sig_count);
+    return s;
+}
+
+//--------------------------------------
+// 密钥创建时间结构
+//--------------------------------------
+
+// 结构名: CREATION_DATETIME
+// 功能: 解析密钥创建时间，使用毫秒级 Unix 时间戳
+// 说明: CREATION_DATETIME 使用 Context[701] Constructed 标签
+//       内部包含一个 INTEGER，值为毫秒级 Unix 时间戳（自 1970-01-01 00:00:00 UTC）
+//       格式: [CONTEXT 701] { INTEGER (通常 6 字节) }
+//       示例: BF 85 3D 08 02 06 01 9B 8C 64 41 01
+//             → Context[701] (8 bytes) → INTEGER (6 bytes) → 0x019B8C644101 ms
+typedef struct {
+    local int64 creation_start = FTell();
+    
+    // Context[701] 内部应该是一个 INTEGER
+    // 注意：701 使用扩展标签号编码 (BF 85 3D)
+    uchar int_tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：表示后续是整数类型的时间戳">;
+    ASN1_LENGTH int_length <comment="时间戳长度：毫秒级Unix时间戳的字节数，通常为6字节">;
+    
+    // 存储时间戳值（毫秒）
+    local uint64 timestamp_ms = 0;
+    local string date_string = "";
+    
+    // 根据 INTEGER 长度读取不同大小的整数
+    // INTEGER 使用 DER 编码，可能是 1-8 字节（通常 6 字节用于毫秒时间戳）
+    if (int_length.actual_length > 0 && int_length.actual_length <= 8) {
+        if (int_length.actual_length == 1) {
+            uchar val <format=hex, hidden=true>;
+            timestamp_ms = val;
+        } else if (int_length.actual_length == 2) {
+            uint16 val <format=hex, hidden=true>;
+            timestamp_ms = val;
+        } else if (int_length.actual_length == 3) {
+            uchar bytes[3] <format=hex, hidden=true>;
+            timestamp_ms = ((uint64)bytes[0] << 16) | ((uint64)bytes[1] << 8) | bytes[2];
+        } else if (int_length.actual_length == 4) {
+            uint32 val <format=hex, hidden=true>;
+            timestamp_ms = val;
+        } else if (int_length.actual_length == 5) {
+            uchar bytes[5] <format=hex, hidden=true>;
+            timestamp_ms = ((uint64)bytes[0] << 32) | ((uint64)bytes[1] << 24) | 
+                          ((uint64)bytes[2] << 16) | ((uint64)bytes[3] << 8) | bytes[4];
+        } else if (int_length.actual_length == 6) {
+            // 最常见的格式：6 字节毫秒时间戳
+            uchar bytes[6] <format=hex, comment="时间戳值：毫秒级Unix时间戳(自1970-01-01 00:00:00 UTC)，6字节大端序编码，可用于推断密钥创建时间或设备重置时间">;
+            timestamp_ms = ((uint64)bytes[0] << 40) | ((uint64)bytes[1] << 32) | 
+                          ((uint64)bytes[2] << 24) | ((uint64)bytes[3] << 16) | 
+                          ((uint64)bytes[4] << 8) | bytes[5];
+        } else if (int_length.actual_length == 7) {
+            uchar bytes[7] <format=hex, hidden=true>;
+            timestamp_ms = ((uint64)bytes[0] << 48) | ((uint64)bytes[1] << 40) | 
+                          ((uint64)bytes[2] << 32) | ((uint64)bytes[3] << 24) | 
+                          ((uint64)bytes[4] << 16) | ((uint64)bytes[5] << 8) | bytes[6];
+        } else if (int_length.actual_length == 8) {
+            uint64 val <format=hex, hidden=true>;
+            timestamp_ms = val;
+        }
+        
+        // 转换为可读日期时间字符串（毫秒级时间戳）
+        // 注意：010 Editor 的日期时间函数有限，这里提供简化的日期时间显示
+        // 实际使用时，可以通过外部工具将时间戳转换为标准日期时间格式
+        // 时间戳值已存储在 timestamp_ms 中，可用于后续处理
+        if (timestamp_ms > 0) {
+            // 计算秒级时间戳和毫秒余数
+            local uint64 timestamp_s = timestamp_ms / 1000;
+            local uint64 ms_remainder = timestamp_ms % 1000;
+            
+            // 计算基本时间单位（用于显示）
+            local uint64 days = timestamp_s / 86400;
+            local uint64 seconds_in_day = timestamp_s % 86400;
+            local uint64 hours = seconds_in_day / 3600;
+            local uint64 minutes = (seconds_in_day % 3600) / 60;
+            local uint64 seconds = seconds_in_day % 60;
+            
+            // Unix epoch: 1970-01-01 00:00:00 UTC
+            // 计算年份（简化：不考虑闰年，仅用于显示）
+            local int year = 1970 + (int)(days / 365);
+            local int day_of_year = (int)(days % 365);
+            local int month = 1 + (day_of_year / 30);  // 简化月份计算
+            local int day = 1 + (day_of_year % 30);
+            
+            // 格式化日期时间字符串
+            // 格式: YYYY-MM-DD HH:MM:SS.mmm UTC
+            SPrintf(date_string, "%04d-%02d-%02d %02d:%02d:%02d.%03d UTC", 
+                   year, month, day, (int)hours, (int)minutes, (int)seconds, (int)ms_remainder);
+        }
+    } else {
+        // 长度异常，直接读取原始数据
+        if (int_length.actual_length > 0 && int_length.actual_length < 100) {
+            uchar raw_data[int_length.actual_length] <format=hex, comment="Raw timestamp data">;
+        }
+    }
+    
+} CREATION_DATETIME <read=ReadCreationDateTime, style=sHeading2>;
+
+// 函数名: ReadCreationDateTime
+// 功能: 格式化显示密钥创建时间
+// 参数:
+//   - cdt: CREATION_DATETIME 结构的引用
+// 返回值: 格式化的字符串，显示时间戳和日期时间
+// 说明: 用于在 010 Editor 界面中显示密钥创建时间信息
+string ReadCreationDateTime(CREATION_DATETIME &cdt) {
+    local string s;
+    if (cdt.timestamp_ms > 0 && cdt.date_string != "") {
+        // 显示日期时间字符串和时间戳值
+        // 注意：对于大于 32 位的时间戳，可能需要特殊处理
+        SPrintf(s, "%s", cdt.date_string);
+    } else if (cdt.timestamp_ms > 0) {
+        // 只显示时间戳值（毫秒）
+        SPrintf(s, "%d ms since epoch", (int)cdt.timestamp_ms);
+    } else {
+        SPrintf(s, "Invalid timestamp");
+    }
+    return s;
+}
+
+//--------------------------------------
+// OS 版本号结构
+//--------------------------------------
+
+// 结构名: OS_VERSION
+// 功能: 解析操作系统版本号，通常是 Android 版本号
+// 说明: OS_VERSION 使用 Context[705] Constructed 标签
+//       内部包含一个 INTEGER，值为 Android 版本号编码
+//       Android 编码规则: OS_VERSION = (major * 10000) + (minor * 100) + patch
+//       格式: [CONTEXT 705] { INTEGER (通常 1-3 字节) }
+//       示例: BF 85 41 05 02 03 01 FB D0
+//             → Context[705] (5 bytes) → INTEGER (3 bytes) → 0x01FBD0 = 130000
+//             → major = 130000 / 10000 = 13, minor = 0, patch = 0 → Android 13.0.0
+typedef struct {
+    local int64 os_version_start = FTell();
+    
+    // Context[705] 内部应该是一个 INTEGER
+    // 注意：705 使用扩展标签号编码 (BF 85 41)
+    uchar int_tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：表示后续是整数类型的操作系统版本号">;
+    ASN1_LENGTH int_length <comment="版本号长度：Android版本号编码的字节数，通常为1-3字节">;
+    
+    // 存储版本号值
+    local uint32 version_value = 0;
+    local string version_string = "";
+    local int major = 0;
+    local int minor = 0;
+    local int patch = 0;
+    
+    // 根据 INTEGER 长度读取不同大小的整数
+    // INTEGER 使用 DER 编码，通常是 1-3 字节（Android 版本号）
+    if (int_length.actual_length > 0 && int_length.actual_length <= 4) {
+        if (int_length.actual_length == 1) {
+            // 1 字节版本号（旧格式，直接是主版本号）
+            uchar val <format=hex, comment="操作系统版本号：1字节旧格式，直接表示主版本号(如Android 8)">;
+            version_value = val;
+            // 旧格式：直接使用值作为主版本号
+            major = version_value;
+            minor = 0;
+            patch = 0;
+        } else if (int_length.actual_length == 2) {
+            uint16 val <format=hex, hidden=true>;
+            version_value = val;
+            // 解析编码格式
+            major = (int)(version_value / 10000);
+            minor = (int)((version_value % 10000) / 100);
+            patch = (int)(version_value % 100);
+        } else if (int_length.actual_length == 3) {
+            // 最常见的格式：3 字节版本号编码
+            uchar bytes[3] <format=hex, comment="操作系统版本号：3字节编码格式，值=主版本*10000+次版本*100+补丁版本，例如130000表示Android 13.0.0">;
+            version_value = ((uint32)bytes[0] << 16) | ((uint32)bytes[1] << 8) | bytes[2];
+            // 解析编码格式：OS_VERSION = (major * 10000) + (minor * 100) + patch
+            major = (int)(version_value / 10000);
+            minor = (int)((version_value % 10000) / 100);
+            patch = (int)(version_value % 100);
+        } else if (int_length.actual_length == 4) {
+            uint32 val <format=hex, hidden=true>;
+            version_value = val;
+            // 解析编码格式
+            major = (int)(version_value / 10000);
+            minor = (int)((version_value % 10000) / 100);
+            patch = (int)(version_value % 100);
+        }
+        
+        // 转换为 Android 版本字符串
+        if (version_value > 0) {
+            if (int_length.actual_length == 1) {
+                // 旧格式：直接显示主版本号
+                SPrintf(version_string, "Android %d", major);
+            } else {
+                // 新格式：显示完整版本号 major.minor.patch
+                SPrintf(version_string, "Android %d.%d.%d", major, minor, patch);
+            }
+        }
+    } else {
+        // 长度异常，直接读取原始数据
+        if (int_length.actual_length > 0 && int_length.actual_length < 100) {
+            uchar raw_data[int_length.actual_length] <format=hex, comment="Raw OS version data">;
+        }
+    }
+    
+} OS_VERSION <read=ReadOSVersion, style=sHeading2>;
+
+// 函数名: ReadOSVersion
+// 功能: 格式化显示操作系统版本号
+// 参数:
+//   - ov: OS_VERSION 结构的引用
+// 返回值: 格式化的字符串，显示版本号
+// 说明: 用于在 010 Editor 界面中显示操作系统版本信息
+string ReadOSVersion(OS_VERSION &ov) {
+    local string s;
+    if (ov.version_value > 0 && ov.version_string != "") {
+        SPrintf(s, "%s (value: %d)", ov.version_string, ov.version_value);
+    } else if (ov.version_value > 0) {
+        SPrintf(s, "Version %d", ov.version_value);
+    } else {
+        SPrintf(s, "Invalid OS version");
+    }
+    return s;
+}
+
+//--------------------------------------
+// OS 补丁级别结构
+//--------------------------------------
+
+// 结构名: OS_PATCHLEVEL
+// 功能: 解析系统安全补丁级别，格式为 YYYYMM
+// 说明: OS_PATCHLEVEL 使用 Context[706] Constructed 标签
+//       内部包含一个 INTEGER，值为 YYYYMM 格式（如 202305 表示 2023年5月）
+//       格式: [CONTEXT 706] { INTEGER (通常 3-4 字节) }
+//       示例: BF 85 42 05 02 03 03 16 41
+//             → Context[706] (5 bytes) → INTEGER (3 bytes) → 0x031641 = 202305
+typedef struct {
+    local int64 patchlevel_start = FTell();
+    
+    // Context[706] 内部应该是一个 INTEGER
+    // 注意：706 使用扩展标签号编码 (BF 85 42)
+    uchar int_tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：表示后续是整数类型的系统安全补丁级别">;
+    ASN1_LENGTH int_length <comment="补丁级别长度：YYYYMM格式编码的字节数，通常为3字节">;
+    
+    // 存储补丁级别值（YYYYMM）
+    local uint32 patchlevel_value = 0;
+    local string patchlevel_string = "";
+    
+    // 根据 INTEGER 长度读取不同大小的整数
+    // INTEGER 使用 DER 编码，通常是 3-4 字节（YYYYMM 格式）
+    if (int_length.actual_length > 0 && int_length.actual_length <= 4) {
+        if (int_length.actual_length == 1) {
+            uchar val <format=hex, hidden=true>;
+            patchlevel_value = val;
+        } else if (int_length.actual_length == 2) {
+            uint16 val <format=hex, hidden=true>;
+            patchlevel_value = val;
+        } else if (int_length.actual_length == 3) {
+            // 最常见的格式：3 字节 YYYYMM
+            uchar bytes[3] <format=hex, comment="系统安全补丁级别：YYYYMM格式，例如202305表示2023年5月的安全补丁，3字节大端序编码">;
+            patchlevel_value = ((uint32)bytes[0] << 16) | ((uint32)bytes[1] << 8) | bytes[2];
+        } else if (int_length.actual_length == 4) {
+            uint32 val <format=hex, hidden=true>;
+            patchlevel_value = val;
+        }
+        
+        // 转换为 YYYY-MM 格式字符串
+        if (patchlevel_value > 0) {
+            local int year = (int)(patchlevel_value / 100);
+            local int month = (int)(patchlevel_value % 100);
+            SPrintf(patchlevel_string, "%04d-%02d", year, month);
+        }
+    } else {
+        // 长度异常，直接读取原始数据
+        if (int_length.actual_length > 0 && int_length.actual_length < 100) {
+            uchar raw_data[int_length.actual_length] <format=hex, comment="Raw patch level data">;
+        }
+    }
+    
+} OS_PATCHLEVEL <read=ReadOSPatchLevel, style=sHeading2>;
+
+// 函数名: ReadOSPatchLevel
+// 功能: 格式化显示系统安全补丁级别
+// 参数:
+//   - opl: OS_PATCHLEVEL 结构的引用
+// 返回值: 格式化的字符串，显示补丁级别
+// 说明: 用于在 010 Editor 界面中显示系统安全补丁级别信息
+string ReadOSPatchLevel(OS_PATCHLEVEL &opl) {
+    local string s;
+    if (opl.patchlevel_value > 0 && opl.patchlevel_string != "") {
+        SPrintf(s, "%s (value: %d)", opl.patchlevel_string, opl.patchlevel_value);
+    } else if (opl.patchlevel_value > 0) {
+        SPrintf(s, "%d (YYYYMM)", opl.patchlevel_value);
+    } else {
+        SPrintf(s, "Invalid patch level");
+    }
+    return s;
+}
+
+//--------------------------------------
+// 厂商补丁级别结构
+//--------------------------------------
+
+// 结构名: VENDOR_PATCHLEVEL
+// 功能: 解析厂商补丁级别，格式为 YYYYMMDD
+// 说明: VENDOR_PATCHLEVEL 使用 Context[718] Constructed 标签
+//       内部包含一个 INTEGER，值为 YYYYMMDD 格式（如 20230515 表示 2023年5月15日）
+//       格式: [CONTEXT 718] { INTEGER (通常 3-4 字节) }
+//       示例: BF 85 66 06 02 04 01 35 0F 0F
+//             → Context[718] (6 bytes) → INTEGER (4 bytes) → 0x01350F0F = 20230515
+typedef struct {
+    local int64 vendor_patchlevel_start = FTell();
+    
+    // Context[718] 内部应该是一个 INTEGER
+    // 注意：718 使用扩展标签号编码 (BF 85 66)
+    uchar int_tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：表示后续是整数类型的厂商补丁级别">;
+    ASN1_LENGTH int_length <comment="补丁级别长度：YYYYMMDD格式编码的字节数，通常为4字节">;
+    
+    // 存储补丁级别值（YYYYMMDD）
+    local uint32 patchlevel_value = 0;
+    local string patchlevel_string = "";
+    
+    // 根据 INTEGER 长度读取不同大小的整数
+    // INTEGER 使用 DER 编码，通常是 3-4 字节（YYYYMMDD 格式）
+    if (int_length.actual_length > 0 && int_length.actual_length <= 4) {
+        if (int_length.actual_length == 1) {
+            uchar val <format=hex, hidden=true>;
+            patchlevel_value = val;
+        } else if (int_length.actual_length == 2) {
+            uint16 val <format=hex, hidden=true>;
+            patchlevel_value = val;
+        } else if (int_length.actual_length == 3) {
+            uchar bytes[3] <format=hex, hidden=true>;
+            patchlevel_value = ((uint32)bytes[0] << 16) | ((uint32)bytes[1] << 8) | bytes[2];
+        } else if (int_length.actual_length == 4) {
+            // 最常见的格式：4 字节 YYYYMMDD
+            uchar bytes[4] <format=hex, comment="厂商补丁级别：YYYYMMDD格式，例如20230515表示2023年5月15日的厂商安全补丁，4字节大端序编码">;
+            patchlevel_value = ((uint32)bytes[0] << 24) | ((uint32)bytes[1] << 16) | 
+                              ((uint32)bytes[2] << 8) | bytes[3];
+        }
+        
+        // 转换为 YYYY-MM-DD 格式字符串
+        if (patchlevel_value > 0) {
+            local int year = (int)(patchlevel_value / 10000);
+            local int month = (int)((patchlevel_value / 100) % 100);
+            local int day = (int)(patchlevel_value % 100);
+            SPrintf(patchlevel_string, "%04d-%02d-%02d", year, month, day);
+        }
+    } else {
+        // 长度异常，直接读取原始数据
+        if (int_length.actual_length > 0 && int_length.actual_length < 100) {
+            uchar raw_data[int_length.actual_length] <format=hex, comment="Raw vendor patch level data">;
+        }
+    }
+    
+} VENDOR_PATCHLEVEL <read=ReadVendorPatchLevel, style=sHeading2>;
+
+// 函数名: ReadVendorPatchLevel
+// 功能: 格式化显示厂商补丁级别
+// 参数:
+//   - vpl: VENDOR_PATCHLEVEL 结构的引用
+// 返回值: 格式化的字符串，显示补丁级别
+// 说明: 用于在 010 Editor 界面中显示厂商补丁级别信息
+string ReadVendorPatchLevel(VENDOR_PATCHLEVEL &vpl) {
+    local string s;
+    if (vpl.patchlevel_value > 0 && vpl.patchlevel_string != "") {
+        SPrintf(s, "%s (value: %d)", vpl.patchlevel_string, vpl.patchlevel_value);
+    } else if (vpl.patchlevel_value > 0) {
+        SPrintf(s, "%d (YYYYMMDD)", vpl.patchlevel_value);
+    } else {
+        SPrintf(s, "Invalid vendor patch level");
+    }
+    return s;
+}
+
+//--------------------------------------
+// 启动镜像补丁级别结构
+//--------------------------------------
+
+// 结构名: BOOT_PATCHLEVEL
+// 功能: 解析启动镜像补丁级别，格式为 YYYYMMDD
+// 说明: BOOT_PATCHLEVEL 使用 Context[719] Constructed 标签
+//       内部包含一个 INTEGER，值为 YYYYMMDD 格式（如 20230515 表示 2023年5月15日）
+//       格式: [CONTEXT 719] { INTEGER (通常 4 字节) }
+//       示例: BF 85 67 06 02 04 01 35 0F 0F
+//             → Context[719] (6 bytes) → INTEGER (4 bytes) → 0x01350F0F = 20230515
+typedef struct {
+    local int64 boot_patchlevel_start = FTell();
+    
+    // Context[719] 内部应该是一个 INTEGER
+    // 注意：719 使用扩展标签号编码 (BF 85 67)
+    uchar int_tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：表示后续是整数类型的启动镜像补丁级别">;
+    ASN1_LENGTH int_length <comment="补丁级别长度：YYYYMMDD格式编码的字节数">;
+    
+    // 存储补丁级别值（YYYYMMDD）
+    local uint32 patchlevel_value = 0;
+    local string patchlevel_string = "";
+    
+    // 根据 INTEGER 长度读取不同大小的整数
+    // INTEGER 使用 DER 编码，通常是 3-4 字节（YYYYMMDD 格式）
+    if (int_length.actual_length > 0 && int_length.actual_length <= 4) {
+        if (int_length.actual_length == 1) {
+            uchar val <format=hex, hidden=true>;
+            patchlevel_value = val;
+        } else if (int_length.actual_length == 2) {
+            uint16 val <format=hex, hidden=true>;
+            patchlevel_value = val;
+        } else if (int_length.actual_length == 3) {
+            uchar bytes[3] <format=hex, hidden=true>;
+            patchlevel_value = ((uint32)bytes[0] << 16) | ((uint32)bytes[1] << 8) | bytes[2];
+        } else if (int_length.actual_length == 4) {
+            // 最常见的格式：4 字节 YYYYMMDD
+            uchar bytes[4] <format=hex, comment="启动镜像补丁级别：YYYYMMDD格式，例如20230515表示2023年5月15日的启动镜像补丁，大端序编码">;
+            patchlevel_value = ((uint32)bytes[0] << 24) | ((uint32)bytes[1] << 16) | 
+                              ((uint32)bytes[2] << 8) | bytes[3];
+        }
+        
+        // 转换为 YYYY-MM-DD 格式字符串
+        if (patchlevel_value > 0) {
+            local int year = (int)(patchlevel_value / 10000);
+            local int month = (int)((patchlevel_value / 100) % 100);
+            local int day = (int)(patchlevel_value % 100);
+            SPrintf(patchlevel_string, "%04d-%02d-%02d", year, month, day);
+        }
+    } else {
+        // 长度异常，直接读取原始数据
+        if (int_length.actual_length > 0 && int_length.actual_length < 100) {
+            uchar raw_data[int_length.actual_length] <format=hex, comment="Raw boot patch level data">;
+        }
+    }
+    
+} BOOT_PATCHLEVEL <read=ReadBootPatchLevel, style=sHeading2>;
+
+// 函数名: ReadBootPatchLevel
+// 功能: 格式化显示启动镜像补丁级别
+// 参数:
+//   - bpl: BOOT_PATCHLEVEL 结构的引用
+// 返回值: 格式化的字符串，显示补丁级别
+// 说明: 用于在 010 Editor 界面中显示启动镜像补丁级别信息
+string ReadBootPatchLevel(BOOT_PATCHLEVEL &bpl) {
+    local string s;
+    if (bpl.patchlevel_value > 0 && bpl.patchlevel_string != "") {
+        SPrintf(s, "%s (value: %d)", bpl.patchlevel_string, bpl.patchlevel_value);
+    } else if (bpl.patchlevel_value > 0) {
+        SPrintf(s, "%d (YYYYMMDD)", bpl.patchlevel_value);
+    } else {
+        SPrintf(s, "Invalid boot patch level");
+    }
+    return s;
+}
+
+//--------------------------------------
+// 信任根结构
+//--------------------------------------
+
+// 结构名: ROOT_OF_TRUST
+// 功能: 解析信任根信息，包含设备锁定状态和启动验证状态
+// 说明: 信任根是 Android 设备安全的基础，包含：
+//       1. 已验证启动密钥 (Verified Boot Key) - 启动验证密钥的 SHA256 哈希
+//       2. 设备锁定状态 (Device Locked) - 设备是否已锁定（0xFF=锁定, 0x00=未锁定）
+//       3. 已验证启动状态 (Verified Boot State) - 启动验证的状态
+//       4. 已验证启动哈希 (可选) - 启动镜像的哈希值
+//       这些信息用于评估设备的安全状态和完整性
+typedef struct {
+    // 首先读取 SEQUENCE 标签和长度
+    uchar seq_tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：信任根信息的序列结构">;
+    ASN1_LENGTH seq_length <comment="SEQUENCE长度：信任根结构的总字节数">;
+    local int64 seq_end = FTell() + seq_length.actual_length;
+    
+    // 已验证启动密钥 (OCTET STRING)
+    uchar vbk_tag <format=hex, hidden=true, comment="OCTET STRING标签(0x04)：已验证启动密钥字段">;
+    uchar vbk_len <hidden=true, comment="启动密钥长度：已验证启动密钥的字节数">;
+    uchar verified_boot_key[vbk_len] <format=hex, comment="已验证启动密钥：启动验证密钥的SHA-256哈希值，用于验证启动镜像的完整性">;
+    
+    // 设备锁定状态 (BOOLEAN)
+    uchar dl_tag <format=hex, hidden=true, comment="BOOLEAN标签(0x01)：设备锁定状态字段">;
+    uchar dl_len <hidden=true, comment="布尔值长度：通常为1字节">;
+    uchar device_locked <format=hex, comment="设备锁定状态：0xFF表示设备已锁定(安全)，0x00表示设备未锁定(可能不安全)">;
+    
+    // 已验证启动状态 (ENUMERATED)
+    uchar vbs_tag <format=hex, hidden=true, comment="ENUMERATED标签(0x0A)：已验证启动状态字段">;
+    uchar vbs_len <hidden=true, comment="枚举值长度：通常为1字节">;
+    VerifiedBootState verified_boot_state <comment="已验证启动状态：0=已验证，1=自签名，2=未验证，3=验证失败，用于评估设备安全状态">;
+    
+    // 可选：已验证启动哈希 (OCTET STRING)
+    if (FTell() < seq_end && ReadByte(FTell()) == ASN1_OCTET_STRING) {
+        uchar vbh_tag <format=hex, hidden=true, comment="OCTET STRING标签(0x04)：已验证启动哈希字段(可选)">;
+        uchar vbh_len <hidden=true, comment="启动哈希长度：启动镜像哈希值的字节数">;
+        if (vbh_len > 0) {
+            uchar verified_boot_hash[vbh_len] <format=hex, comment="已验证启动哈希：启动镜像的哈希值(可选字段)，用于验证启动镜像完整性">;
+        }
+    }
+    
+    // 读取 SEQUENCE 中任何剩余的字节
+    if (FTell() < seq_end) {
+        local int remaining = seq_end - FTell();
+        if (remaining > 0) {
+            uchar rot_padding[remaining] <format=hex, hidden=true>;
+        }
+    }
+} ROOT_OF_TRUST <read=ReadRootOfTrust, style=sHeading2>;
+
+// 函数名: ReadRootOfTrust
+// 功能: 格式化显示信任根信息
+// 参数:
+//   - rot: ROOT_OF_TRUST 结构的引用
+// 返回值: 格式化的字符串，显示设备锁定状态、启动验证状态和启动密钥长度
+// 说明: 用于在 010 Editor 界面中显示信任根信息摘要
+string ReadRootOfTrust(ROOT_OF_TRUST &rot) {
+    local string s;
+    SPrintf(s, "%s | %s | VBKey:%dB", 
+            rot.device_locked ? "Locked" : "Unlocked",
+            BootStateToString(rot.verified_boot_state),
+            rot.vbk_len);
+    return s;
+}
+
+//--------------------------------------
+// 递归 ASN.1 标签解析器
+//--------------------------------------
+
+// 全局变量：用于跟踪嵌套深度
+// 说明: 在递归解析 ASN.1 结构时，用于控制缩进和防止无限递归
+local int g_recursion_depth = 0;
+
+// 结构名: ASN1_TAG
+// 功能: 递归解析 ASN.1 标签，支持嵌套结构和特殊标签处理
+// 说明: 这是核心解析器，能够：
+//       1. 解析基本类型和构造类型的 ASN.1 标签
+//       2. 递归处理嵌套的构造类型
+//       3. 特殊处理以下标签：
+//          - Application[99] (认证应用 ID)
+//          - Context[701] (密钥创建时间，毫秒级 Unix 时间戳)
+//          - Context[704] (信任根)
+//          - Context[705] (操作系统版本号，Android 版本)
+//          - Context[706] (系统安全补丁级别，YYYYMM 格式)
+//          - Context[709] (认证应用 ID)
+//          - Context[718] (厂商补丁级别，YYYYMMDD 格式)
+//          - Context[719] (启动镜像补丁级别，YYYYMMDD 格式)
+//       4. 自动处理扩展标签号（多字节标签号，如 701 = BF 85 3D, 705 = BF 85 41, 706 = BF 85 42, 718 = BF 85 66）
+//       5. 边界检查和错误恢复
+typedef struct {
+    local int64 tag_start = FTell();  // 标签开始位置
+    uchar tag <format=hex, hidden=true, comment="ASN.1标签字节：包含标签类别(高2位)、构造标志(第6位)和标签号(低5位)">;
+    
+    // 解析标签属性
+    local int is_extended = ((tag & 0x1F) == 0x1F);      // 是否为扩展标签（标签号 >= 31）
+    local int is_constructed = (tag & 0x20) != 0;         // 是否为构造类型（第6位为1）
+    local int tag_class = (tag >> 6) & 0x03;              // 标签类别：0=通用, 1=应用, 2=上下文, 3=私有
+    local int tag_number = tag & 0x1F;                    // 标签号（低5位）
+    
+    // 如果需要，读取扩展标签号（多字节编码）
+    // 扩展标签号使用 BER 编码：每个字节的最高位表示是否还有后续字节
+    if (is_extended) {
+        local int ext_tag_num = 0;
+        local uchar ext_byte;
+        do {
+            ext_byte = ReadUByte(FTell());
+            uchar ext_tag_byte <format=hex, hidden=true, comment="扩展标签号字节：多字节标签号编码，最高位为1表示还有后续字节">;
+            ext_tag_num = (ext_tag_num << 7) | (ext_byte & 0x7F);  // 左移7位后或运算
+        } while ((ext_byte & 0x80) != 0);  // 最高位为1表示还有后续字节
+        tag_number = ext_tag_num;
+    }
+    
+    // 读取长度字段
+    uchar len_first <hidden=true, comment="长度字段首字节：最高位区分短格式(0)和长格式(1)">;
+    local int content_length = 0;
+    if ((len_first & 0x80) == 0) {
+        // 短格式：长度直接编码在第一个字节中
+        content_length = len_first;
+    } else {
+        // 长格式：第一个字节的低7位表示后续长度字节数
+        local int len_bytes = len_first & 0x7F;
+        if (len_bytes == 1) {
+            uchar len_val <hidden=true, comment="长度值：1字节长格式的长度值">;
+            content_length = len_val;
+        } else if (len_bytes == 2) {
+            uchar len_vals[2] <hidden=true, comment="长度值：2字节长格式的长度值，大端序">;
+            content_length = (len_vals[0] << 8) | len_vals[1];  // 大端序
+        }
+    }
+    
+    local int64 content_start = FTell();  // 内容开始位置
+    local int64 content_end = content_start + content_length;  // 内容结束位置
+    
+    // 生成缩进字符串以显示层级（用于调试输出）
+    local string indent = "";
+    local int i_indent;
+    for (i_indent = 0; i_indent < g_recursion_depth; i_indent++) {
+        indent += "  ";
+    }
+    
+    // 调试：打印标签信息
+    if (tag_number == 709 || (tag_class == 1 && tag_number == 99)) {
+        Printf("%s[DEBUG] Tag check: class=%d, number=%d, constructed=%d, length=%d\n", 
+               indent, tag_class, tag_number, is_constructed, content_length);
+    }
+    
+    // 特殊处理：认证应用 ID
+    // 可能以两种形式出现：
+    // 1. Application[99] PRIMITIVE - 直接包含编码的 AttestationApplicationId
+    // 2. Context[709] CONSTRUCTED - 包含 OCTET STRING，其内容为 AttestationApplicationId
+    if (tag_class == 1 && tag_number == 99 && !is_constructed && content_length > 0) {
+        Printf("%s[ATTESTATION_APPLICATION_ID] App[99] PRIMITIVE at 0x%X, %d bytes\n", 
+               indent, tag_start, content_length);
+        Printf("%s  Parsing encoded AttestationApplicationId...\n", indent);
+        ATTESTATION_APPLICATION_ID app_id;
+    }
+    // 特殊处理：认证应用 ID (Context[709])
+    // 在授权列表中，使用 Context[709] CONSTRUCTED，内部包含 OCTET STRING
+    // 注意：709 需要扩展标签号编码，tag_number 在扩展解析后应该是 709
+    else if (tag_number == 709 && is_constructed && content_length > 0) {
+        Printf("%s[ATTESTATION_APPLICATION_ID] Ctx[709] CONSTRUCTED at 0x%X, %d bytes (tag_number=%d)\n", 
+               indent, tag_start, content_length, tag_number);
+        Printf("%s  Parsing inner OCTET STRING containing AttestationApplicationId...\n", indent);
+        
+        // Context[709] 内部应该是一个 OCTET STRING
+        local int64 inner_start = FTell();
+        local uchar inner_tag = ReadUByte(inner_start);
+        
+        if (inner_tag == ASN1_OCTET_STRING) {
+            // 跳过外层的 OCTET STRING tag 和 length，直接解析内容
+            uchar octet_tag <format=hex, hidden=true>;
+            ASN1_LENGTH octet_length;
+            Printf("%s  Found OCTET STRING wrapper: %d bytes\n", indent, octet_length.actual_length);
+            
+            // 现在文件指针在 OCTET STRING 内容开始位置
+            // 解析 AttestationApplicationId
+            ATTESTATION_APPLICATION_ID app_id;
+            
+            // 确保解析后位于 content_end
+            if (FTell() < content_end) {
+                local int remaining = content_end - FTell();
+                if (remaining > 0) {
+                    Printf("%s  [WARNING] %d bytes remaining after AttestationApplicationId\n", 
+                           indent, remaining);
+                    uchar appid_remaining[remaining] <format=hex, hidden=true>;
+                }
+            }
+        } else {
+            Printf("%s  [WARNING] Expected OCTET STRING inside Context[709], found 0x%02X\n", 
+                   indent, inner_tag);
+            // 继续正常解析
+        }
+    }
+    // 特殊处理：密钥创建时间 (Context[701])
+    // 格式: [CONTEXT 701] Constructed { INTEGER (毫秒时间戳) }
+    // 注意：701 使用扩展标签号编码 (BF 85 3D)
+    else if (tag_number == 701 && is_constructed && content_length > 0) {
+        Printf("%s[CREATION_DATETIME] Found tag 701 at 0x%X, %d bytes\n", 
+               indent, tag_start, content_length);
+        Printf("%s  Parsing INTEGER timestamp (ms since epoch)...\n", indent);
+        
+        CREATION_DATETIME creation_datetime;
+        
+        // 确保解析 CREATION_DATETIME 后位于 content_end
+        if (FTell() < content_end) {
+            local int remaining = content_end - FTell();
+            if (remaining > 0) {
+                Printf("%s  [WARNING] %d bytes remaining after CREATION_DATETIME\n", 
+                       indent, remaining);
+                uchar cdt_remaining[remaining] <format=hex, hidden=true>;
+            }
+        } else if (FTell() > content_end) {
+            Printf("%s  [WARNING] Overran content_end by %d bytes, rewinding\n", 
+                   indent, FTell() - content_end);
+            FSeek(content_end);
+        }
+    }
+    // 特殊处理：操作系统版本号 (Context[705])
+    // 格式: [CONTEXT 705] Constructed { INTEGER (Android 版本号) }
+    // 注意：705 使用扩展标签号编码 (BF 85 41)
+    else if (tag_number == 705 && is_constructed && content_length > 0) {
+        Printf("%s[OS_VERSION] Found tag 705 at 0x%X, %d bytes\n", 
+               indent, tag_start, content_length);
+        Printf("%s  Parsing INTEGER OS version...\n", indent);
+        
+        OS_VERSION os_version;
+        
+        // 确保解析 OS_VERSION 后位于 content_end
+        if (FTell() < content_end) {
+            local int remaining = content_end - FTell();
+            if (remaining > 0) {
+                Printf("%s  [WARNING] %d bytes remaining after OS_VERSION\n", 
+                       indent, remaining);
+                uchar ov_remaining[remaining] <format=hex, hidden=true>;
+            }
+        } else if (FTell() > content_end) {
+            Printf("%s  [WARNING] Overran content_end by %d bytes, rewinding\n", 
+                   indent, FTell() - content_end);
+            FSeek(content_end);
+        }
+    }
+    // 特殊处理：系统安全补丁级别 (Context[706])
+    // 格式: [CONTEXT 706] Constructed { INTEGER (YYYYMM) }
+    // 注意：706 使用扩展标签号编码 (BF 85 42)
+    else if (tag_number == 706 && is_constructed && content_length > 0) {
+        Printf("%s[OS_PATCHLEVEL] Found tag 706 at 0x%X, %d bytes\n", 
+               indent, tag_start, content_length);
+        Printf("%s  Parsing INTEGER patch level (YYYYMM)...\n", indent);
+        
+        OS_PATCHLEVEL os_patchlevel;
+        
+        // 确保解析 OS_PATCHLEVEL 后位于 content_end
+        if (FTell() < content_end) {
+            local int remaining = content_end - FTell();
+            if (remaining > 0) {
+                Printf("%s  [WARNING] %d bytes remaining after OS_PATCHLEVEL\n", 
+                       indent, remaining);
+                uchar opl_remaining[remaining] <format=hex, hidden=true>;
+            }
+        } else if (FTell() > content_end) {
+            Printf("%s  [WARNING] Overran content_end by %d bytes, rewinding\n", 
+                   indent, FTell() - content_end);
+            FSeek(content_end);
+        }
+    }
+    // 特殊处理：厂商补丁级别 (Context[718])
+    // 格式: [CONTEXT 718] Constructed { INTEGER (YYYYMMDD) }
+    // 注意：718 使用扩展标签号编码 (BF 85 66)
+    else if (tag_number == 718 && is_constructed && content_length > 0) {
+        Printf("%s[VENDOR_PATCHLEVEL] Found tag 718 at 0x%X, %d bytes\n", 
+               indent, tag_start, content_length);
+        Printf("%s  Parsing INTEGER vendor patch level (YYYYMMDD)...\n", indent);
+        
+        VENDOR_PATCHLEVEL vendor_patchlevel;
+        
+        // 确保解析 VENDOR_PATCHLEVEL 后位于 content_end
+        if (FTell() < content_end) {
+            local int remaining = content_end - FTell();
+            if (remaining > 0) {
+                Printf("%s  [WARNING] %d bytes remaining after VENDOR_PATCHLEVEL\n", 
+                       indent, remaining);
+                uchar vpl_remaining[remaining] <format=hex, hidden=true>;
+            }
+        } else if (FTell() > content_end) {
+            Printf("%s  [WARNING] Overran content_end by %d bytes, rewinding\n", 
+                   indent, FTell() - content_end);
+            FSeek(content_end);
+        }
+    }
+    // 特殊处理：启动镜像补丁级别 (Context[719])
+    // 格式: [CONTEXT 719] Constructed { INTEGER (YYYYMMDD) }
+    // 注意：719 使用扩展标签号编码 (BF 85 67)
+    else if (tag_number == 719 && is_constructed && content_length > 0) {
+        Printf("%s[BOOT_PATCHLEVEL] Found tag 719 at 0x%X, %d bytes\n", 
+               indent, tag_start, content_length);
+        Printf("%s  Parsing INTEGER boot patch level (YYYYMMDD)...\n", indent);
+        
+        BOOT_PATCHLEVEL boot_patchlevel;
+        
+        // 确保解析 BOOT_PATCHLEVEL 后位于 content_end
+        if (FTell() < content_end) {
+            local int remaining = content_end - FTell();
+            if (remaining > 0) {
+                Printf("%s  [WARNING] %d bytes remaining after BOOT_PATCHLEVEL\n", 
+                       indent, remaining);
+                uchar bpl_remaining[remaining] <format=hex, hidden=true>;
+            }
+        } else if (FTell() > content_end) {
+            Printf("%s  [WARNING] Overran content_end by %d bytes, rewinding\n", 
+                   indent, FTell() - content_end);
+            FSeek(content_end);
+        }
+    }
+    // 特殊处理：信任根 (Context[704])
+    else if (tag_number == 704 && content_length > 0) {
+        Printf("%s[ROOT_OF_TRUST] Found tag 704 at 0x%X, %d bytes\n", 
+               indent, tag_start, content_length);
+        ROOT_OF_TRUST root_of_trust;
+        
+        // 确保解析 ROOT_OF_TRUST 后位于 content_end
+        if (FTell() < content_end) {
+            local int remaining = content_end - FTell();
+            if (remaining > 0) {
+                uchar rot_remaining[remaining] <format=hex, hidden=true>;
+            }
+        }
+    } 
+    // 构造类型：递归解析嵌套标签
+    // 注意：Context[709] (ATTESTATION_APPLICATION_ID) 需要特殊处理
+    else if (is_constructed && content_length > 0 && content_length < 2000) {
+        // 特殊处理：Context[709] - AttestationApplicationId
+        if (tag_number == 709 && tag_class == 2) {
+            Printf("%s[ATTESTATION_APPLICATION_ID] Ctx[709] CONSTRUCTED at 0x%X, %d bytes\n", 
+                   indent, tag_start, content_length);
+            Printf("%s  Parsing inner OCTET STRING containing AttestationApplicationId...\n", indent);
+            
+            // Context[709] 内部应该是一个 OCTET STRING
+            local int64 inner_start = FTell();
+            local uchar inner_tag = ReadUByte(inner_start);
+            
+            if (inner_tag == ASN1_OCTET_STRING) {
+                // 读取 OCTET STRING tag 和 length
+                uchar octet_tag <format=hex, hidden=true>;
+                ASN1_LENGTH octet_length;
+                Printf("%s  Found OCTET STRING wrapper: %d bytes\n", indent, octet_length.actual_length);
+                
+                // 现在文件指针在 OCTET STRING 内容开始位置
+                // 解析 AttestationApplicationId
+                ATTESTATION_APPLICATION_ID app_id;
+                
+                // 确保解析后位于 content_end
+                if (FTell() < content_end) {
+                    local int remaining = content_end - FTell();
+                    if (remaining > 0) {
+                        Printf("%s  [WARNING] %d bytes remaining after AttestationApplicationId\n", 
+                               indent, remaining);
+                        uchar appid_remaining[remaining] <format=hex, hidden=true>;
+                    }
+                } else if (FTell() > content_end) {
+                    Printf("%s  [WARNING] Overran content_end by %d bytes, rewinding\n", 
+                           indent, FTell() - content_end);
+                    FSeek(content_end);
+                }
+            } else {
+                Printf("%s  [WARNING] Expected OCTET STRING inside Context[709], found 0x%02X, falling back to normal parsing\n", 
+                       indent, inner_tag);
+                // 回退到正常构造类型解析
+                FSeek(inner_start);
+                Printf("%s[CONSTRUCTED] %s at 0x%X, %d bytes (recursing...)\n", 
+                       indent, GetTagDescription(tag_class, tag_number), tag_start, content_length);
+                
+                g_recursion_depth++;  // 增加嵌套深度
+                local int nested_count = 0;
+                // 递归解析嵌套的标签
+                while (FTell() < content_end && FTell() < FileSize() && nested_count < 50) {
+                    struct ASN1_TAG nested_tag;  // 递归调用
+                    nested_count++;
+                }
+                g_recursion_depth--;  // 恢复嵌套深度
+            }
+        } else {
+            // 普通构造类型处理
+            Printf("%s[CONSTRUCTED] %s at 0x%X, %d bytes (recursing...)\n", 
+                   indent, GetTagDescription(tag_class, tag_number), tag_start, content_length);
+            
+            g_recursion_depth++;  // 增加嵌套深度
+            local int nested_count = 0;
+            // 递归解析嵌套的标签
+            while (FTell() < content_end && FTell() < FileSize() && nested_count < 50) {
+                struct ASN1_TAG nested_tag;  // 递归调用
+                nested_count++;
+            }
+            g_recursion_depth--;  // 恢复嵌套深度
+        }
+        
+        // 检查是否有剩余字节
+        local int64 after_nested = FTell();
+        if (after_nested < content_end) {
+            local int remaining = content_end - after_nested;
+            Printf("%s  [CONSTRUCTED] After nested parsing: 0x%X, %d bytes remaining to content_end 0x%X\n",
+                   indent, after_nested, remaining, content_end);
+            uchar remaining_bytes[remaining] <format=hex, hidden=true>;
+        } else if (after_nested > content_end) {
+            Printf("%s  [CONSTRUCTED] WARNING: Overran content_end by %d bytes, rewinding to 0x%X\n",
+                   indent, after_nested - content_end, content_end);
+            FSeek(content_end);
+        } else {
+            Printf("%s  [CONSTRUCTED] Perfect: exactly at content_end 0x%X\n", indent, content_end);
+        }
+    } 
+    // 基本类型：直接读取数据
+    else if (content_length > 0 && content_length < 2000) {
+        Printf("%s[PRIMITIVE] %s at 0x%X, %d bytes\n",
+               indent, GetTagDescription(tag_class, tag_number), tag_start, content_length);
+        uchar data[content_length] <format=hex, comment="ASN.1标签数据：基本类型(非构造类型)的原始数据内容">;
+    } 
+    // 处理零长度或非常大的标签
+    else {
+        if (content_length == 0) {
+            Printf("%s[EMPTY] %s at 0x%X, 0 bytes\n",
+                   indent, GetTagDescription(tag_class, tag_number), tag_start);
+        } else {
+            Printf("%s[LARGE/SKIP] %s at 0x%X, %d bytes (skipping)\n",
+                   indent, GetTagDescription(tag_class, tag_number), tag_start, content_length);
+            // 跳过大内容以避免解析问题
+            if (content_length > 0 && content_length < 10000) {
+                uchar skip_data[content_length] <format=hex, hidden=true>;
+            } else {
+                // 对于非常大的标签，直接跳转到结束位置
+                FSeek(content_end);
+            }
+        }
+    }
+    
+    // 最终安全检查：确保位于 content_end
+    if (FTell() < content_end && content_length > 0 && content_length < 2000) {
+        local int final_remaining = content_end - FTell();
+        if (final_remaining > 0) {
+            uchar final_padding[final_remaining] <format=hex, hidden=true>;
+        }
+    } else if (FTell() > content_end && content_length > 0) {
+        Printf("%s[WARNING] Overran content_end by %d bytes, rewinding\n", 
+               indent, FTell() - content_end);
+        FSeek(content_end);
+    }
+    
+} ASN1_TAG <read=ReadASN1Tag>;
+
+// 函数名: GetTagDescription
+// 功能: 根据标签类别和标签号生成描述字符串
+// 参数:
+//   - tag_class: 标签类别（0=通用, 1=应用, 2=上下文, 3=私有）
+//   - tag_number: 标签号
+// 返回值: 格式化的描述字符串
+// 说明: 对于应用类和上下文类标签，会显示更详细的描述信息
+string GetTagDescription(int tag_class, int tag_number) {
+    local string s;
+    if (tag_class == 1) {  // 应用类
+        SPrintf(s, "App[%d]", tag_number);
+    } else if (tag_class == 2) {  // 上下文类（Keymaster 标签）
+        SPrintf(s, "Ctx[%d]: %s", tag_number, GetKeymasterTagName(tag_number));
+    } else {
+        SPrintf(s, "Tag[%d]", tag_number);
+    }
+    return s;
+}
+
+// 函数名: GetTagDescriptionFromByte
+// 功能: 从单个字节中提取标签信息并生成描述字符串
+// 参数:
+//   - tag_byte: 标签字节值
+// 返回值: 格式化的描述字符串
+// 说明: 简化版本，假设标签号在单字节内（不处理扩展标签号）
+string GetTagDescriptionFromByte(uchar tag_byte) {
+    local string s;
+    local int tag_class = (tag_byte >> 6) & 0x03;  // 提取高2位作为类别
+    local int tag_number = tag_byte & 0x1F;         // 提取低5位作为标签号
+    
+    // 处理扩展标签号（简化版本 - 假设单字节）
+    if (tag_number == 0x1F) {
+        // 扩展标签 - 需要更复杂的解析（此处简化处理）
+        SPrintf(s, "Extended Tag");
+    } else if (tag_class == 1) {  // 应用类
+        SPrintf(s, "App[%d]", tag_number);
+    } else if (tag_class == 2) {  // 上下文类
+        SPrintf(s, "Ctx[%d]: %s", tag_number, GetKeymasterTagName(tag_number));
+    } else {
+        SPrintf(s, "Tag[%d]", tag_number);
+    }
+    return s;
+}
+    
+// 函数名: ReadASN1Tag
+// 功能: 格式化显示 ASN1_TAG 结构的内容
+// 参数:
+//   - t: ASN1_TAG 结构的引用
+// 返回值: 格式化的字符串，显示标签类型和内容长度
+// 说明: 用于在 010 Editor 界面中显示标签信息
+string ReadASN1Tag(ASN1_TAG &t) {
+    local string s;
+    if (t.is_constructed) {
+        SPrintf(s, "%s CONSTRUCTED (%d bytes)", 
+                GetTagDescription(t.tag_class, t.tag_number), t.content_length);
+    } else {
+        SPrintf(s, "%s (%d bytes)", 
+                GetTagDescription(t.tag_class, t.tag_number), t.content_length);
+    }
+    return s;
+}
+
+// 结构名: AUTHORIZATION_LIST
+// 功能: 解析授权列表，包含密钥的各种属性和限制
+// 说明: 授权列表是 Keymaster 认证记录的重要组成部分，包含：
+//       1. 软件强制属性（Software Enforced）- 由 Android 系统强制
+//       2. TEE 强制属性（TEE Enforced）- 由 TEE 环境强制，包含信任根信息
+//       使用递归 ASN1_TAG 解析器来解析列表中的所有标签
+typedef struct {
+    // 调试：显示当前位置和即将读取的字节
+    local int64 debug_pos = FTell();
+    local uchar debug_tag = ReadUByte(debug_pos);
+    local uchar debug_len_byte = ReadUByte(debug_pos + 1);
+    Printf("    [DEBUG] AUTHORIZATION_LIST starting at 0x%X\n", debug_pos);
+    Printf("    [DEBUG] Tag byte: 0x%02X, Length byte: 0x%02X\n", debug_tag, debug_len_byte);
+    
+    uchar tag <format=hex, hidden=true, comment="授权列表标签：SEQUENCE标签(0x30)，表示授权列表的开始">;
+    ASN1_LENGTH length <comment="授权列表长度：包含所有密钥属性和限制标签的总字节数">;
+    
+    Printf("    [DEBUG] After reading tag+length, now at 0x%X\n", FTell());
+    Printf("    [DEBUG] Parsed length: %d bytes\n", length.actual_length);
+    
+    local int64 list_start = FTell();  // 列表内容开始位置
+    local int64 list_end = list_start + length.actual_length;  // 列表内容结束位置
+    local int found_rot = 0;  // 是否找到信任根（标签 704）
+    
+    Printf("    Parsing Authorization List: %d bytes (0x%X to 0x%X)\n", 
+           length.actual_length, list_start, list_end);
+    
+    // 使用递归 ASN1_TAG 解析器
+    local int tag_count = 0;
+    local int64 before_parse = 0;
+    local int64 after_parse = 0;
+    local uchar peek_tag = 0;
+    local uchar peek_len_byte = 0;
+    local int peek_content_len = 0;
+    local int peek_total_size = 0;
+    local int peek_len_bytes = 0;
+    
+    // 循环解析列表中的所有标签
+    while (FTell() < list_end && FTell() < FileSize() && tag_count < 100) {
+        before_parse = FTell();
+        
+        // 基本检查：至少需要 2 个字节（标签 + 长度）
+        if (before_parse + 2 > list_end) {
+            Printf("      [%d] Only %d bytes remaining (need at least 2), stopping\n", 
+                   tag_count, list_end - before_parse);
+            break;
+        }
+        
+        Printf("      [%d] Parsing tag at 0x%X (remaining: %d bytes to 0x%X)\n", 
+               tag_count, before_parse, list_end - before_parse, list_end);
+        ASN1_TAG asn1_tag;
+        
+        // 检查是否找到信任根（标签 704）
+        if (asn1_tag.tag_number == 704) {
+            found_rot = 1;
+        }
+        
+        // 解析后，检查是否仍在边界内
+        after_parse = FTell();
+        Printf("      [%d] After parsing: position 0x%X (consumed %d bytes, remaining: %d bytes to 0x%X)\n", 
+               tag_count, after_parse, after_parse - before_parse, list_end - after_parse, list_end);
+        
+        if (after_parse > list_end) {
+            Printf("      [%d] ERROR: After parsing tag, position 0x%X exceeds list_end 0x%X, rewinding\n", 
+                   tag_count, after_parse, list_end);
+            FSeek(list_end);
+            break;
+        }
+        
+        // 如果文件指针没有前进，说明有问题
+        if (after_parse <= before_parse) {
+            Printf("      [%d] ERROR: File pointer didn't advance (was 0x%X, now 0x%X), stopping\n", 
+                   tag_count, before_parse, after_parse);
+            break;
+        }
+        
+        tag_count++;
+    }
+    
+    // 读取任何剩余的字节
+    if (FTell() < list_end) {
+        local int remaining = list_end - FTell();
+        if (remaining > 0) {
+            Printf("      [INFO] %d bytes remaining after parsing %d tags (at 0x%X, list_end=0x%X)\n", 
+                   remaining, tag_count, FTell(), list_end);
+            // 尝试将剩余字节解析为标签
+            local int remaining_tag_count = 0;
+            while (FTell() < list_end && remaining_tag_count < 20) {
+                local int64 rem_before = FTell();
+                if (rem_before + 2 > list_end) {
+                    break;
+                }
+                Printf("      [%d] Parsing remaining tag at 0x%X\n", tag_count + remaining_tag_count, rem_before);
+                ASN1_TAG remaining_tag;
+                remaining_tag_count++;
+                if (FTell() >= list_end || FTell() <= rem_before) {
+                    break;
+                }
+            }
+            // 如果仍有字节，标记为未解析
+            if (FTell() < list_end) {
+                local int still_remaining = list_end - FTell();
+                uchar unparsed_data[still_remaining] <format=hex, comment="未解析数据：授权列表中无法解析的剩余字节", hidden=true>;
+            }
+        }
+    }
+    
+} AUTHORIZATION_LIST <read=ReadAuthList, style=sSection1>;
+
+// 函数名: ReadAuthList
+// 功能: 格式化显示授权列表信息
+// 参数:
+//   - al: AUTHORIZATION_LIST 结构的引用
+// 返回值: 格式化的字符串，显示列表长度和是否找到信任根
+// 说明: 用于在 010 Editor 界面中显示授权列表信息摘要
+string ReadAuthList(AUTHORIZATION_LIST &al) {
+    local string s;
+    if (al.found_rot) {
+        SPrintf(s, "%d bytes (Root of Trust found)", al.length.actual_length);
+    } else {
+        SPrintf(s, "%d bytes", al.length.actual_length);
+    }
+    return s;
+}
+
+// 函数名: GetKMTagName
+// 功能: 生成 Keymaster 标签的完整名称字符串
+// 参数:
+//   - tag_num: Keymaster 标签号
+// 返回值: 格式化的字符串，包含标签号和标签名称
+// 说明: 用于在界面中显示 Keymaster 标签的完整信息
+string GetKMTagName(int tag_num) {
+    local string s;
+    SPrintf(s, "KM_TAG_%d (%s)", tag_num, GetKeymasterTagName(tag_num));
+    return s;
+}
+
+// 函数名: GetContextTagName
+// 功能: 生成上下文标签的名称字符串
+// 参数:
+//   - ctx_num: 上下文标签号
+// 返回值: 格式化的字符串，显示上下文标签号
+// 说明: 用于在界面中显示上下文标签信息
+string GetContextTagName(int ctx_num) {
+    local string s;
+    SPrintf(s, "Context[%d]", ctx_num);
+    return s;
+}
+
+//--------------------------------------
+// Attestation Record Structure
+//--------------------------------------
+
+typedef struct {
+    uchar tag <format=hex, comment="SEQUENCE标签(0x30)：认证记录的序列结构", hidden=true>;
+    ASN1_LENGTH length <comment="认证记录长度：包含版本、安全级别、Keymaster信息等所有字段的总字节数">;
+    
+    local int64 attestation_start = FTell();
+    local int64 attestation_end = attestation_start + length.actual_length;
+    
+    Printf("Parsing Attestation Record (%d bytes, 0x%X to 0x%X)\n", 
+           length.actual_length, attestation_start, attestation_end);
+    
+    // Version
+    Printf("  [DEBUG] Before Attestation Version at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：认证版本字段">;
+        uchar len <hidden=true, comment="版本值长度">;
+        Printf("  [DEBUG] Attestation Version: tag=0x%02X, len=%d\n", tag, len);
+        // CRITICAL: Always read exactly 'len' bytes
+        local int actual_value = 0;
+        if (len > 0) {
+            uchar value[len] <comment="认证版本：100表示v1，200表示v2，用于标识认证记录格式版本">;
+            // Store the last byte as the actual value (most common case)
+            actual_value = value[len-1];
+        }
+    } attestation_version <name="Attestation Version", style=sHeading3>;
+    Printf("  [DEBUG] After Attestation Version at 0x%X\n", FTell());
+    
+    // Security Level
+    Printf("  [DEBUG] Before Attestation Security Level at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="ENUMERATED标签(0x0A)：认证安全级别字段">;
+        uchar len <hidden=true, comment="安全级别值长度">;
+        Printf("  [DEBUG] Attestation Security Level: tag=0x%02X, len=%d\n", tag, len);
+        // CRITICAL: Always read exactly 'len' bytes
+        local int actual_value = 0;
+        if (len > 0) {
+            uchar value[len] <comment="认证安全级别：0=软件级别，1=TEE级别，2=StrongBox级别">;
+            // Store the last byte as the actual value
+            actual_value = value[len-1];
+        }
+    } attestation_security_level <name="Attestation Security Level", style=sHeading3>;
+    Printf("  [DEBUG] After Attestation Security Level at 0x%X\n", FTell());
+    
+    // Keymaster Version
+    Printf("  [DEBUG] Before Keymaster Version at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：Keymaster版本字段">;
+        uchar len <hidden=true, comment="版本值长度">;
+        Printf("  [DEBUG] Keymaster Version: tag=0x%02X, len=%d\n", tag, len);
+        // CRITICAL: Always read exactly 'len' bytes
+        local int actual_value = 0;
+        if (len > 0) {
+            uchar value[len] <comment="Keymaster HAL版本：Keymaster硬件抽象层版本号，例如4表示Keymaster 4.0">;
+            // Store the last byte as the actual value
+            actual_value = value[len-1];
+        }
+    } keymaster_version <name="Keymaster Version", style=sHeading3>;
+    Printf("  [DEBUG] After Keymaster Version at 0x%X\n", FTell());
+    
+    // Keymaster Security Level
+    Printf("  [DEBUG] Before Keymaster Security Level at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="ENUMERATED标签(0x0A)：Keymaster安全级别字段">;
+        uchar len <hidden=true, comment="安全级别值长度">;
+        Printf("  [DEBUG] Keymaster Security Level: tag=0x%02X, len=%d\n", tag, len);
+        // CRITICAL: Always read exactly 'len' bytes
+        local int actual_value = 0;
+        if (len > 0) {
+            uchar value[len] <comment="Keymaster安全级别：0=软件级别，1=TEE级别，2=StrongBox级别">;
+            // Store the last byte as the actual value
+            actual_value = value[len-1];
+        }
+    } keymaster_security_level <name="Keymaster Security Level", style=sHeading3>;
+    Printf("  [DEBUG] After Keymaster Security Level at 0x%X\n", FTell());
+    
+    // Attestation Challenge
+    Printf("  [DEBUG] Before Attestation Challenge at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="OCTET STRING标签(0x04)：认证挑战字段">;
+        uchar len <hidden=true, comment="挑战值长度">;
+        Printf("  [DEBUG] Attestation Challenge: tag=0x%02X, len=%d\n", tag, len);
+        // CRITICAL: Always read exactly 'len' bytes to ensure file pointer advances correctly
+        if (len > 0) {
+            uchar value[len] <format=hex, comment="认证挑战：客户端提供的随机数(nonce)，用于防止重放攻击，确保认证记录的唯一性">;
+        }
+    } attestation_challenge <name="Attestation Challenge", style=sHeading3>;
+    Printf("  [DEBUG] After Attestation Challenge at 0x%X\n", FTell());
+    
+    // Unique ID (optional)
+    Printf("  [DEBUG] Checking for Unique ID at 0x%X, next byte=0x%02X\n", FTell(), ReadUByte(FTell()));
+    if (ReadByte(FTell()) == ASN1_OCTET_STRING) {
+        struct {
+            uchar tag <format=hex, hidden=true, comment="OCTET STRING标签(0x04)：设备唯一ID字段(可选)">;
+            uchar len <hidden=true, comment="唯一ID长度">;
+            Printf("  [DEBUG] Unique ID: tag=0x%02X, len=%d\n", tag, len);
+            if (len > 0) {
+                uchar value[len] <format=hex, comment="设备唯一ID：设备的唯一标识符(可选字段)，用于设备识别">;
+            }
+        } unique_id <name="Unique ID", style=sHeading3>;
+        Printf("  [DEBUG] After Unique ID at 0x%X\n", FTell());
+    } else {
+        Printf("  [DEBUG] No Unique ID found, continuing at 0x%X\n", FTell());
+    }
+    
+    // Software Enforced
+    Printf("  [DEBUG] Before Software Enforced at 0x%X\n", FTell());
+    Printf("  [DEBUG] Next 20 bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+           ReadUByte(FTell()), ReadUByte(FTell()+1), ReadUByte(FTell()+2), ReadUByte(FTell()+3),
+           ReadUByte(FTell()+4), ReadUByte(FTell()+5), ReadUByte(FTell()+6), ReadUByte(FTell()+7),
+           ReadUByte(FTell()+8), ReadUByte(FTell()+9), ReadUByte(FTell()+10), ReadUByte(FTell()+11),
+           ReadUByte(FTell()+12), ReadUByte(FTell()+13), ReadUByte(FTell()+14), ReadUByte(FTell()+15),
+           ReadUByte(FTell()+16), ReadUByte(FTell()+17), ReadUByte(FTell()+18), ReadUByte(FTell()+19));
+    AUTHORIZATION_LIST software_enforced <name="Software Enforced Authorizations">;
+    
+    // TEE Enforced
+    Printf("Parsing TEE Enforced List at 0x%X\n", FTell());
+    local int64 tee_enforced_start = FTell();
+    
+    // Try parsing with declared length first (hidden, for checking only)
+    AUTHORIZATION_LIST tee_enforced <hidden=true>;
+    
+    // Check if ROOT_OF_TRUST was found
+    if (!tee_enforced.found_rot) {
+        Printf("  [WARNING] ROOT_OF_TRUST not found in TEE Enforced (declared %d bytes)\n", 
+               tee_enforced.length.actual_length);
+        Printf("  -> Recalculating TEE Enforced length from structure...\n");
+        Printf("  -> Rewinding to 0x%X (tee_enforced_start)\n", tee_enforced_start);
+        
+        // Rewind to tee_enforced_start and parse again with corrected length
+        FSeek(tee_enforced_start);
+        
+        // Skip the tag (read but don't display)
+        local uchar temp_tag = ReadUByte(FTell());
+        FSkip(1);
+        
+        Printf("  -> Skipped tag 0x%02X at 0x%X\n", temp_tag, tee_enforced_start);
+        
+        struct {
+            // Read and display length using same structure as AUTHORIZATION_LIST
+            ASN1_LENGTH length <name="Length (declared, not used)", bgcolor=0xFFE0B2, comment="Declared length, actual parsing uses corrected range">;
+            
+            // Calculate corrected length from current position to attestation_end
+            local int64 content_start = FTell();
+            local int corrected_length = attestation_end - content_start;
+            local int64 list_start = content_start;
+            local int64 list_end = attestation_end;
+            local int found_rot = 0;
+            
+            Printf("  -> Declared length: %d bytes (ignored)\n", length.actual_length);
+            Printf("  -> Corrected content length: %d bytes (from 0x%X to 0x%X)\n", 
+                   corrected_length, content_start, attestation_end);
+            Printf("    Parsing Authorization List: %d bytes (0x%X to 0x%X)\n", 
+                   corrected_length, list_start, list_end);
+            
+            // Use recursive ASN1_TAG parser
+            local int tag_count = 0;
+            local int64 before_parse = 0;
+            local int64 after_parse = 0;
+            local uchar peek_tag = 0;
+            local uchar peek_len_byte = 0;
+            local int peek_content_len = 0;
+            local int peek_total_size = 0;
+            local int peek_len_bytes = 0;
+            
+            while (FTell() < list_end && FTell() < FileSize() && tag_count < 100) {
+                before_parse = FTell();
+                
+                // Safety check
+                if (before_parse + 2 >= list_end) {
+                    Printf("      [%d] Only %d bytes remaining, stopping\n", 
+                           tag_count, list_end - before_parse);
+                    break;
+                }
+                
+                // Peek at tag and length
+                peek_tag = ReadUByte(before_parse);
+                peek_len_byte = ReadUByte(before_parse + 1);
+                peek_content_len = 0;
+                peek_total_size = 2;
+                
+                if ((peek_len_byte & 0x80) == 0) {
+                    peek_content_len = peek_len_byte;
+    } else {
+                    peek_len_bytes = peek_len_byte & 0x7F;
+                    if (peek_len_bytes == 1 && before_parse + 2 < list_end) {
+                        peek_content_len = ReadUByte(before_parse + 2);
+                        peek_total_size = 3;
+                    } else if (peek_len_bytes == 2 && before_parse + 3 < list_end) {
+                        peek_content_len = (ReadUByte(before_parse + 2) << 8) | ReadUByte(before_parse + 3);
+                        peek_total_size = 4;
+                    }
+                }
+                
+                peek_total_size += peek_content_len;
+                
+                if (before_parse + peek_total_size > list_end) {
+                    // Silently stop at boundary
+                    break;
+                }
+                
+                Printf("      [%d] Parsing tag at 0x%X (list_end=0x%X, remaining=%d)\n", 
+                       tag_count, before_parse, list_end, list_end - before_parse);
+                
+                ASN1_TAG asn1_tag;
+                
+                after_parse = FTell();
+                Printf("      [%d] After parse: at 0x%X (consumed %d bytes)\n", 
+                       tag_count, after_parse, after_parse - before_parse);
+                
+                if (asn1_tag.tag_number == 704) {
+                    found_rot = 1;
+                    Printf("      [OK] ROOT_OF_TRUST found!\n");
+                }
+                
+                if (FTell() > list_end) {
+                    Printf("      [ERROR] Overran list_end by %d bytes! Breaking loop.\n", 
+                           FTell() - list_end);
+                    break;
+                }
+                
+                tag_count++;
+            }
+            
+            if (FTell() < list_end) {
+                local int remaining = list_end - FTell();
+                if (remaining > 0) {
+                    // Silently mark remaining unparsed bytes
+                    uchar unparsed_data[remaining] <format=hex, comment="Unparsed data", hidden=true>;
+                }
+            }
+        } tee_enforced_corrected <name="TEE Enforced Authorizations", bgcolor=0xE8F5E9>;
+    } else {
+        // ROOT_OF_TRUST found in first parse, display the original structure
+        FSeek(tee_enforced_start);
+        AUTHORIZATION_LIST tee_enforced_final <name="TEE Enforced Authorizations", bgcolor=0xE8F5E9>;
+    }
+    
+} ATTESTATION_RECORD <read=ReadAttestationRecord, style=sHeading1>;
+
+// 函数名: ReadAttestationRecord
+// 功能: 格式化显示认证记录信息
+// 参数:
+//   - ar: ATTESTATION_RECORD 结构的引用
+// 返回值: 格式化的字符串，显示认证版本、安全级别和 Keymaster 版本信息
+// 说明: 用于在 010 Editor 界面中显示认证记录的关键信息摘要
+string ReadAttestationRecord(ATTESTATION_RECORD &ar) {
+    local string s;
+    SPrintf(s, "v%d | %s | KeymasterV%d | %s", 
+            ar.attestation_version.actual_value,
+            SecurityLevelToString(ar.attestation_security_level.actual_value),
+            ar.keymaster_version.actual_value,
+            SecurityLevelToString(ar.keymaster_security_level.actual_value));
+    return s;
+}
+
+//--------------------------------------
+// TEE Attestation Extension
+//--------------------------------------
+
+typedef struct {
+    local int64 ext_start = FTell();
+    Printf("Parsing TEE Extension at 0x%X\n", ext_start);
+    
+    // Extension SEQUENCE wrapper
+    uchar ext_tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：扩展结构的序列包装">;
+    ASN1_LENGTH ext_length <comment="扩展长度：包含OID、关键标志和扩展值的总字节数">;
+    
+    // OID
+    struct {
+        uchar tag <format=hex, hidden=true, comment="OBJECT IDENTIFIER标签(0x06)：扩展OID字段">;
+        uchar len <hidden=true, comment="OID长度">;
+        uchar oid[len] <format=hex, comment="扩展OID：1.3.6.1.4.1.11129.2.1.17，标识这是Android TEE密钥认证扩展">;
+    } extension_oid <name="TEE Attestation OID", style=sHeading2Accent>;
+    
+    // Critical flag (optional)
+    if (ReadByte(FTell()) == ASN1_BOOLEAN) {
+        struct {
+            uchar tag <format=hex, hidden=true, comment="BOOLEAN标签(0x01)：关键标志字段(可选)">;
+            uchar len <hidden=true, comment="布尔值长度">;
+            uchar value <format=hex, comment="关键标志：0xFF表示此扩展为关键扩展，必须被识别">;
+        } critical_flag <name="Critical Flag">;
+    }
+    
+    // Extension Value (OCTET STRING wrapper)
+    uchar value_tag <format=hex, hidden=true, comment="OCTET STRING标签(0x04)：扩展值字段">;
+    ASN1_LENGTH value_length <comment="扩展值长度：包含认证记录的字节数">;
+    
+    // Attestation Record inside
+    ATTESTATION_RECORD attestation_record;
+    
+    Printf("TEE Extension complete at 0x%X\n", FTell());
+    
+} TEE_ATTESTATION_EXTENSION <name="TEE Key Attestation", style=sHeading1Accent>;
+
+//--------------------------------------
+// X.509 Extensions
+//--------------------------------------
+
+typedef struct {
+    local int64 exts_start = FTell();
+    Printf("Parsing X.509 Extensions at 0x%X\n", exts_start);
+    
+    // [3] Context tag
+    uchar context_tag <format=hex, comment="上下文标签[3](0xA3)：X.509证书扩展字段的上下文标签", hidden=true>;
+    ASN1_LENGTH context_length <comment="扩展上下文长度：包含所有扩展的总字节数">;
+    
+    // Extensions SEQUENCE
+    uchar seq_tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：扩展序列结构">;
+    ASN1_LENGTH seq_length <comment="扩展序列长度：所有扩展项的字节数">;
+    
+    local int64 seq_data_start = FTell();
+    local int64 seq_data_end = seq_data_start + seq_length.actual_length;
+    
+    Printf("  Extensions SEQUENCE: %d bytes (0x%X to 0x%X)\n", 
+           seq_length.actual_length, seq_data_start, seq_data_end);
+    
+    // Search for TEE Attestation OID
+    local uchar TEE_OID[10] = {0x2B, 0x06, 0x01, 0x04, 0x01, 0xD6, 0x79, 0x02, 0x01, 0x11};
+    local int64 search_pos = seq_data_start;
+    local int found_tee = 0;
+    local int tee_oid_match = 0;  // Declare outside loop to avoid re-declaration
+    
+    while (search_pos < seq_data_end - 10) {
+        tee_oid_match = 1;  // Assume match, then check
+        for (g_j = 0; g_j < 10; g_j++) {
+            if (ReadByte(search_pos + g_j) != TEE_OID[g_j]) {
+                tee_oid_match = 0;
+                break;
+            }
+        }
+        if (tee_oid_match) {
+            found_tee = 1;
+            Printf("  Found TEE OID at 0x%X\n", search_pos);
+            break;
+        }
+        search_pos++;
+    }
+    
+    if (found_tee) {
+        // Find start of extension (backtrack to SEQUENCE tag)
+        local int64 ext_start = search_pos - 1;
+        while (ext_start > seq_data_start && ReadByte(ext_start) != 0x30) {
+            ext_start--;
+        }
+        
+        // Skip other extensions before TEE extension
+        local int skip_bytes = ext_start - seq_data_start;
+            if (skip_bytes > 0) {
+            Printf("  Skipping %d bytes of other extensions before TEE\n", skip_bytes);
+            uchar other_extensions_before[skip_bytes] <name="Other Extensions (Before)", format=hex, style=sSection2>;
+        }
+        
+        // Parse TEE Attestation Extension
+        Printf("  Parsing TEE Attestation Extension at 0x%X\n", FTell());
+        TEE_ATTESTATION_EXTENSION tee_extension;
+        
+        // Read remaining extensions after TEE extension
+        if (FTell() < seq_data_end) {
+            local int remaining_ext = seq_data_end - FTell();
+            Printf("  Reading %d bytes of remaining extensions after TEE\n", remaining_ext);
+            if (remaining_ext > 0 && remaining_ext < 5000) {
+                uchar other_extensions_after[remaining_ext] <name="Other Extensions (After)", format=hex, style=sSection2>;
+            }
+        }
+    } else {
+        Printf("  TEE OID not found, reading all extensions\n");
+        if (seq_length.actual_length > 0) {
+            uchar all_extensions[seq_length.actual_length] <name="Extensions Data", format=hex, style=sSection1>;
+        }
+    }
+    
+    Printf("Extensions complete at 0x%X\n", FTell());
+    
+} X509_EXTENSIONS <name="Certificate Extensions", style=sHeading2>;
+
+//--------------------------------------
+// X.509 Certificate Structure
+//--------------------------------------
+
+typedef struct {
+    local int64 cert_start = FTell();
+    Printf("\n========================================\n");
+    Printf("Parsing X.509 Certificate at 0x%X\n", cert_start);
+    Printf("========================================\n");
+    
+    // Certificate SEQUENCE
+    uchar cert_tag <format=hex, comment="SEQUENCE标签(0x30)：X.509证书的根序列结构", hidden=true>;
+    ASN1_LENGTH cert_length <comment="证书长度：整个X.509证书的总字节数，包括TBSCertificate、签名算法和签名值">;
+    
+    local int64 cert_data_start = FTell();
+    local int64 cert_expected_end = cert_data_start + cert_length.actual_length;
+    local int64 file_end = FileSize();
+    
+    Printf("Certificate length: %d bytes (declared)\n", cert_length.actual_length);
+    Printf("Certificate data starts at: 0x%X\n", cert_data_start);
+    Printf("Certificate expected end: 0x%X\n", cert_expected_end);
+    Printf("File size: %d bytes (0x%X)\n", file_end, file_end);
+    
+    if (cert_expected_end > file_end) {
+        Printf("[WARNING] Certificate declared length (%d bytes) exceeds file size (%d bytes) by %d bytes\n",
+               cert_length.actual_length, file_end - cert_data_start, cert_expected_end - file_end);
+    } else if (cert_expected_end < file_end) {
+        Printf("[INFO] File contains %d bytes after certificate end (may be additional data)\n",
+               file_end - cert_expected_end);
+    }
+    Printf("\n");
+    
+    // TBSCertificate SEQUENCE
+    uchar tbs_tag <format=hex, comment="SEQUENCE标签(0x30)：待签名证书(TBSCertificate)序列结构", hidden=true>;
+    ASN1_LENGTH tbs_length <comment="TBSCertificate长度：包含版本、序列号、颁发者、有效期、主题、公钥、扩展等所有证书信息的字节数">;
+    
+    local int64 tbs_start = FTell();
+    local int64 tbs_end = tbs_start + tbs_length.actual_length;
+    
+    Printf("TBSCertificate: %d bytes (0x%X to 0x%X)\n", tbs_length.actual_length, tbs_start, tbs_end);
+    
+    // Version [0]
+    // 重要：必须使用 ReadUByte() 而不是 ReadByte()
+    // 因为 ReadByte() 返回 signed char，0xA0(160) 会被解释为 -96
+    if (ReadUByte(FTell()) == 0xA0) {
+        struct {
+            uchar ctx_tag <format=hex, hidden=true, comment="上下文标签[0](0xA0)：版本字段的上下文标签">;
+            uchar ctx_len <hidden=true, comment="上下文长度">;
+            uchar int_tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：版本值字段">;
+            uchar int_len <hidden=true, comment="版本值长度">;
+            uchar value <comment="证书版本：0=v1，1=v2，2=v3，X.509证书格式版本号">;
+        } version <name="Version", style=sHeading2>;
+        Printf("  Version: v%d\n", version.value + 1);
+    }
+    
+    // Serial Number
+    Printf("  Before Serial Number: FTell()=0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="INTEGER标签(0x02)：证书序列号字段">;
+        uchar len <hidden=true, comment="序列号长度">;
+        Printf("    Serial tag=0x%02X, len=0x%02X\n", tag, len);
+        // CRITICAL: Always read 'len' bytes regardless of value
+        if (len > 0) {
+            uchar value[len] <format=hex, comment="证书序列号：证书颁发者分配的唯一序列号，大端序编码">;
+        }
+    } serial_number <name="Serial Number", style=sHeading2>;
+    Printf("  After Serial Number: FTell()=0x%X (consumed %d bytes)\n", 
+           FTell(), FTell() - (FTell() - serial_number.len - 2));
+    
+    // Signature Algorithm (in TBS)
+    Printf("  Parsing Signature Algorithm at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：签名算法标识符字段">;
+        uchar len <hidden=true, comment="算法标识符长度">;
+        // CRITICAL: Always read 'len' bytes
+        if (len > 0) {
+            uchar data[len] <format=hex, comment="签名算法标识符：包含算法OID和参数，用于标识证书签名使用的算法(如SHA256withRSA)">;
+        }
+    } signature_algorithm_tbs <name="Signature Algorithm", style=sSection1>;
+    Printf("  Signature Algorithm: %d bytes, position after: 0x%X\n", 
+           signature_algorithm_tbs.len, FTell());
+    
+    // Issuer
+    Printf("  Parsing Issuer at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：颁发者字段">;
+        ASN1_LENGTH length <comment="颁发者长度：颁发者可分辨名称(DN)的字节数">;
+        
+        Printf("    Issuer tag=0x%02X, length=%d bytes\n", tag, length.actual_length);
+        
+        if (length.actual_length > 0 && length.actual_length < 2048) {
+            uchar dn[length.actual_length] <format=hex, comment="颁发者可分辨名称：证书颁发者的X.500可分辨名称，包含组织、国家等信息">;
+        }
+    } issuer <name="Issuer", style=sSection1>;
+    Printf("  Issuer: %d bytes, position after: 0x%X\n", issuer.length.actual_length, FTell());
+    
+    // Validity
+    Printf("  Parsing Validity at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：有效期字段">;
+        uchar len <hidden=true, comment="有效期长度">;
+        // CRITICAL: Always read 'len' bytes
+        if (len > 0) {
+            uchar data[len] <format=hex, comment="有效期：包含notBefore(生效时间)和notAfter(过期时间)，使用UTC时间或通用时间格式">;
+        }
+    } validity <name="Validity Period", style=sSection1>;
+    Printf("  Validity: %d bytes, position after: 0x%X\n", validity.len, FTell());
+    
+    // Subject
+    Printf("  Parsing Subject at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：主题字段">;
+        ASN1_LENGTH length <comment="主题长度：主题可分辨名称(DN)的字节数">;
+        
+        Printf("    Subject tag=0x%02X, length=%d bytes\n", tag, length.actual_length);
+        
+        if (length.actual_length > 0 && length.actual_length < 2048) {
+            uchar dn[length.actual_length] <format=hex, comment="主题可分辨名称：证书持有者的X.500可分辨名称，包含组织、国家等信息">;
+        }
+    } subject <name="Subject", style=sSection1>;
+    Printf("  Subject: %d bytes, position after: 0x%X\n", subject.length.actual_length, FTell());
+    
+    // Subject Public Key Info
+    Printf("  Parsing Public Key Info at 0x%X\n", FTell());
+    struct {
+        uchar tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：公钥信息字段">;
+        ASN1_LENGTH length <comment="公钥信息长度：包含公钥算法和公钥值的字节数">;
+        
+        Printf("    PK tag=0x%02X, length=%d bytes\n", tag, length.actual_length);
+        
+        if (length.actual_length > 0 && length.actual_length < 4096) {
+            uchar data[length.actual_length] <format=hex, comment="公钥信息：包含公钥算法标识符和公钥值，用于验证证书签名">;
+        }
+    } subject_public_key_info <name="Public Key Info", style=sSection2>;
+    
+    Printf("  Public Key: %d bytes, current position: 0x%X\n", 
+           subject_public_key_info.length.actual_length, FTell());
+    
+    // Extensions [3]
+    Printf("  Checking for Extensions at 0x%X, next byte: 0x%02X\n", FTell(), ReadUByte(FTell()));
+    if (ReadUByte(FTell()) == 0xA3) {
+        Printf("  [OK] Found Extensions [3], parsing...\n\n");
+        X509_EXTENSIONS extensions;
+    } else {
+        Printf("  [X] Extensions not found (expected 0xA3)\n");
+    }
+    
+    // Skip any remaining TBS data
+    if (FTell() < tbs_end) {
+        local int remaining = tbs_end - FTell();
+        Printf("  Skipping %d bytes of TBS data\n", remaining);
+        if (remaining > 0 && remaining < 1000) {
+            uchar tbs_remaining[remaining] <name="Remaining TBS Data", format=hex, hidden=true>;
+        }
+    }
+    
+    Printf("\nTBSCertificate complete at 0x%X\n\n", FTell());
+    
+    // Check if we have enough data for signature
+    if (FTell() >= FileSize()) {
+        Printf("[WARNING] File ends at TBSCertificate, no signature present\n");
+        Printf("Certificate parsing complete at 0x%X\n", FTell());
+        Printf("========================================\n\n");
+        return;
+    }
+    
+    if (FTell() + 2 > FileSize()) {
+        Printf("[WARNING] File truncated, only %d bytes remaining\n", FileSize() - FTell());
+        Printf("Certificate parsing complete at 0x%X\n", FTell());
+        Printf("========================================\n\n");
+        return;
+    }
+    
+    // Signature Algorithm (outside TBS)
+    struct {
+        uchar tag <format=hex, hidden=true, comment="SEQUENCE标签(0x30)：证书签名算法标识符字段">;
+        uchar len <hidden=true, comment="算法标识符长度">;
+        // CRITICAL: Always read 'len' bytes, but check file bounds
+        if (len > 0 && FTell() + len <= FileSize()) {
+            uchar data[len] <format=hex, comment="签名算法标识符：用于证书签名的算法标识符，应与TBSCertificate中的算法标识符一致">;
+        }
+    } signature_algorithm <name="Signature Algorithm", style=sSection1>;
+    
+    // Check if we have enough data for signature value
+    if (FTell() + 2 > FileSize()) {
+        Printf("[WARNING] File truncated before signature value\n");
+        Printf("Certificate parsing complete at 0x%X\n", FTell());
+        Printf("========================================\n\n");
+        return;
+    }
+    
+    // Signature Value
+    struct {
+        uchar tag <format=hex, hidden=true, comment="BIT STRING标签(0x03)：证书签名值字段">;
+        ASN1_LENGTH length <comment="签名值长度：数字签名的字节数">;
+        
+        local int sig_available = FileSize() - FTell();
+        Printf("  Signature Value: declared %d bytes, %d bytes available\n", 
+               length.actual_length, sig_available);
+        
+        if (length.actual_length > 0 && length.actual_length <= sig_available && length.actual_length < 2048) {
+            uchar data[length.actual_length] <format=hex, comment="数字签名：对TBSCertificate进行签名的结果，用于验证证书的完整性和真实性">;
+            Printf("  Signature: %d bytes\n", length.actual_length);
+        } else if (length.actual_length > sig_available && sig_available > 0) {
+            Printf("  [WARNING] Signature truncated: declared %d bytes, only %d available\n",
+                   length.actual_length, sig_available);
+            uchar partial_data[sig_available] <format=hex, comment="部分签名：文件截断，只读取了部分签名数据">;
+        } else if (length.actual_length == 0) {
+            Printf("  [WARNING] Signature length is 0\n");
+        } else if (length.actual_length >= 2048) {
+            Printf("  [WARNING] Signature too large: %d bytes (max 2048), reading available %d bytes\n",
+                   length.actual_length, sig_available);
+            if (sig_available > 0 && sig_available < 2048) {
+                uchar partial_data[sig_available] <format=hex, comment="部分签名：签名值过大，只读取可用部分">;
+            }
+        } else {
+            // 其他情况：读取可用的数据
+            Printf("  [WARNING] Unexpected signature length condition, reading available %d bytes\n", sig_available);
+            if (sig_available > 0 && sig_available < 2048) {
+                uchar fallback_data[sig_available] <format=hex, comment="签名数据(回退)：异常情况下读取的签名数据">;
+            }
+        }
+    } signature_value <name="Signature Value", style=sSection2>;
+    
+    // 检查是否还有剩余数据（可能是多个证书或其他数据）
+    if (FTell() < FileSize()) {
+        local int remaining_after_sig = FileSize() - FTell();
+        Printf("\n  [INFO] %d bytes remaining after signature (at 0x%X, file end: 0x%X)\n", 
+               remaining_after_sig, FTell(), FileSize());
+        if (remaining_after_sig > 0 && remaining_after_sig < 10000) {
+            // 尝试解析剩余数据（可能是另一个证书或其他结构）
+            local uchar peek_tag = ReadUByte(FTell());
+            if (peek_tag == 0x30) {
+                Printf("  [INFO] Remaining data starts with SEQUENCE (0x30), may be another certificate\n");
+                uchar remaining_data[remaining_after_sig] <name="Remaining Data (Possible Additional Certificate)", format=hex, style=sSection2>;
+            } else {
+                Printf("  [INFO] Remaining data starts with 0x%02X\n", peek_tag);
+                uchar remaining_data[remaining_after_sig] <name="Remaining Data", format=hex, style=sSection2>;
+            }
+        } else if (remaining_after_sig >= 10000) {
+            Printf("  [WARNING] Large amount of remaining data (%d bytes), skipping\n", remaining_after_sig);
+            FSeek(FileSize());
+        }
+    }
+    
+    Printf("\nCertificate parsing complete at 0x%X\n", FTell());
+    Printf("========================================\n\n");
+    
+} X509_CERTIFICATE <read=ReadX509Certificate, open=true, style=sHeading1Accent>;
+
+// 函数名: ReadX509Certificate
+// 功能: 格式化显示 X.509 证书信息
+// 参数:
+//   - cert: X509_CERTIFICATE 结构的引用
+// 返回值: 格式化的字符串，显示证书版本和总长度
+// 说明: 用于在 010 Editor 界面中显示证书的基本信息摘要
+//       如果存在版本字段，显示具体版本号；否则默认为 v1
+string ReadX509Certificate(X509_CERTIFICATE &cert) {
+    local string s;
+    if (exists(cert.version)) {
+        SPrintf(s, "X.509 v%d Certificate (%d bytes)", 
+                cert.version.value + 1, 
+                cert.cert_length.actual_length);
+    } else {
+        SPrintf(s, "X.509 v1 Certificate (%d bytes)", 
+                cert.cert_length.actual_length);
+    }
+    return s;
+}
+
+//--------------------------------------
+// 主解析入口点
+//--------------------------------------
+
+// 验证文件
+// 说明: 检查文件是否符合 X.509 证书的基本格式要求
+if (FileSize() < 4) {
+    PrintWarning("File too small to be a valid certificate");
+    return -1;
+}
+
+// 检查文件是否以 SEQUENCE 标签 (0x30) 开头
+// 说明: 所有有效的 ASN.1 DER 编码的 X.509 证书都以 SEQUENCE 标签开始
+if (ReadByte(0) != 0x30) {
+    PrintWarning("Invalid certificate: does not start with SEQUENCE tag (0x30)");
+    return -1;
+}
+
+// 显示横幅
+Printf("╔═══════════════════════════════════════════════════════════════╗\n");
+Printf("║   TEE Certificate Parser v4.1 - Professional Edition         ║\n");
+Printf("║   Android Key Attestation Certificate Analyzer               ║\n");
+Printf("╚═══════════════════════════════════════════════════════════════╝\n\n");
+Printf("File: %s\n", GetFileName());
+Printf("Size: %d bytes\n\n", FileSize());
+
+// 解析证书
+// 说明: 从 X509_CERTIFICATE 结构开始解析，它会递归解析所有子结构
+X509_CERTIFICATE certificate;
+
+// 解析摘要
+// 说明: 显示解析统计信息，包括已解析的字节数、警告数量和解析状态
+Printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
+  Printf("║                    Parsing Summary                            ║\n");
+  Printf("╠═══════════════════════════════════════════════════════════════╣\n");
+  Printf("║  Bytes parsed: %d / %d (%.1f%%)                          \n", FTell(), FileSize(), (float)FTell() * 100.0 / FileSize());
+  Printf("║  Warnings: %d                                                 \n", g_warnings);
+
+if (FTell() >= FileSize()) {
+  Printf("║  Status: [OK] Complete                                        \n");
+} else if (FTell() >= FileSize() - 1) {
+  Printf("║  Status: [OK] Complete (1 padding byte)                      \n");
+} else {
+  Printf("║  Status: [WARNING] Incomplete (%d bytes remaining)           \n", FileSize() - FTell());
+}
+  Printf("╚═══════════════════════════════════════════════════════════════╝\n");
