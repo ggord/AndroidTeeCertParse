@@ -9,6 +9,7 @@ import (
 func main() {
 	// List of certificate paths to parse
 	certPaths := []string{
+		// Uncomment additional certificates to test
 		// "assests/cert_k30pro.bin",
 		"assests/cert_oneplus.bin",
 		// "assests/cert_pixel4.bin",

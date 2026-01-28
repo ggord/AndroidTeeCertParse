@@ -564,6 +564,44 @@ Keymaster 标签在 ASN.1 中使用 Context 标签编码：
 
 ---
 
+## Go 语言实现
+
+### 项目结构
+
+本项目使用 Go 语言重新实现，代码结构如下：
+
+- **main.go**: 主程序入口，演示如何解析证书文件
+- **asn1.go**: ASN.1 DER 编码解析器，支持扩展标签号解析
+- **parser.go**: X.509 证书和 TEE 扩展解析器
+- **types.go**: 数据结构定义（RootOfTrust, AuthorizationList, AttestationRecord 等）
+
+### 代码示例
+
+```go
+// 从文件加载证书
+cert, err := NewTeeCertFromFile("assests/cert_oneplus.bin")
+if err != nil {
+    log.Fatal(err)
+}
+
+// 获取认证记录
+attestationRecord := cert.X509Cert.TBSCert.Extensions.TEEExtension.AttestationRecord
+
+// 访问设备安全信息
+fmt.Printf("Security Level: %d\n", attestationRecord.AttestationSecurityLevel)
+fmt.Printf("OS Version: %d\n", attestationRecord.TEEEnforced.OSVersion)
+fmt.Printf("Device Locked: %v\n", attestationRecord.TEEEnforced.RootOfTrust.DeviceLocked)
+```
+
+### 技术特点
+
+1. **零依赖**: 仅使用 Go 标准库，无需第三方依赖
+2. **手工解析**: 手工实现 ASN.1 DER 解析，完全控制解析过程
+3. **类型安全**: 利用 Go 的强类型系统，避免内存安全问题
+4. **简洁代码**: 相比 C++ 实现，代码更简洁易读
+
+---
+
 ## 总结
 
 ### 关键要点
