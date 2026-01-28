@@ -34,6 +34,20 @@ go build -o AndroidTeeCertParse
 
 程序将解析十六进制字符串中的证书数据。支持证书链解析（多个证书连接在一起）。
 
+#### 逐字段完整解析（详细模式）
+
+```bash
+./AndroidTeeCertParse -verbose -hex "3082028b30820232a00302010202090..."
+```
+
+使用 `-verbose` 参数启用详细模式，将显示每个 ASN.1 字段的完整信息：
+- 字段偏移量（Offset）
+- 标签类型和编号（Tag, TagNumber）
+- 字段长度（Length）
+- 原始十六进制内容（Content hex）
+- 解析后的值（整数、字符串、布尔值等）
+- 嵌套结构的递归解析
+
 ### 输出示例
 
 #### 文件解析输出
@@ -171,6 +185,54 @@ Verified Boot Key Size: 0 bytes
 OS Version: 90000
 OS Patch Level: 201907
 ```
+
+#### 详细模式输出示例（-verbose）
+
+详细模式将显示每个 ASN.1 字段的完整信息：
+
+```
+=== Detailed ASN.1 Field Dump ===
+Offset 0000: [Universal CONSTRUCTED] Tag=0x30 (SEQUENCE) Length=688 TagNumber=16
+  Content: 688 bytes (too large to display)
+  Offset 0004: [Universal CONSTRUCTED] Tag=0x30 (SEQUENCE) Length=598 TagNumber=16
+    Content: 598 bytes (too large to display)
+    Offset 0008: [Context CONSTRUCTED] Tag=0xA0 (Context[0]) Length=3 TagNumber=0
+      Offset 0010: [Universal PRIMITIVE] Tag=0x02 (INTEGER) Length=1 TagNumber=2
+        Content (hex): 02 
+        Content (int):  2
+    Offset 0013: [Universal PRIMITIVE] Tag=0x02 (INTEGER) Length=1 TagNumber=2
+      Content (hex): 01 
+      Content (int):  1
+    Offset 0016: [Universal CONSTRUCTED] Tag=0x30 (SEQUENCE) Length=10 TagNumber=16
+      Offset 0018: [Universal PRIMITIVE] Tag=0x06 (OBJECT IDENTIFIER) Length=8 TagNumber=6
+        Content (hex): 2A 86 48 CE 3D 04 03 02
+    ...
+    Offset 0361: [Universal PRIMITIVE] Tag=0x04 (OCTET STRING) Length=209 TagNumber=4
+      Content: 209 bytes (too large to display)
+      > Parsing nested ASN.1 content:
+        Offset 0000: [Universal CONSTRUCTED] Tag=0x30 (SEQUENCE) Length=206 TagNumber=16
+          Offset 0003: [Universal PRIMITIVE] Tag=0x02 (INTEGER) Length=1 TagNumber=2
+            Content (hex): 02 
+            Content (int):  2
+          Offset 0006: [Universal PRIMITIVE] Tag=0x0A (ENUMERATED) Length=1 TagNumber=10
+            Content (hex): 00 
+            Content (enum): 0
+          ...
+          Offset 0121: [Context CONSTRUCTED] Tag=0xBF (Context[31]) Length=5 TagNumber=705
+            Offset 0125: [Universal PRIMITIVE] Tag=0x02 (INTEGER) Length=3 TagNumber=2
+              Content (hex): 01 5F 90 
+              Content (int):  90000
+          Offset 0130: [Context CONSTRUCTED] Tag=0xBF (Context[31]) Length=5 TagNumber=706
+            Offset 0134: [Universal PRIMITIVE] Tag=0x02 (INTEGER) Length=3 TagNumber=2
+              Content (hex): 03 14 B3 
+              Content (int):  201907
+```
+
+详细模式特别适用于：
+- 深入学习 ASN.1 和 X.509 证书结构
+- 调试证书解析问题
+- 分析 TEE 认证扩展的每个字段
+- 理解 Keymaster 标签的编码方式
 
 ## 项目链接
 
