@@ -30,7 +30,15 @@ func main() {
 
 		fmt.Println("[Native-TEE] Certificate parsed successfully!")
 
-		// Get attestation record
+		// Get attestation record with nil checks
+		if cert.X509Cert == nil || cert.X509Cert.TBSCert == nil ||
+			cert.X509Cert.TBSCert.Extensions == nil ||
+			cert.X509Cert.TBSCert.Extensions.TEEExtension == nil ||
+			cert.X509Cert.TBSCert.Extensions.TEEExtension.AttestationRecord == nil {
+			log.Printf("[Native-TEE] Error: Certificate structure is incomplete")
+			continue
+		}
+
 		attestationRecord := cert.X509Cert.TBSCert.Extensions.TEEExtension.AttestationRecord
 
 		// Print Keymaster Security Level

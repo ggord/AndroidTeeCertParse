@@ -166,6 +166,8 @@ func (e *ASN1Element) GetNextOffset() int {
 }
 
 // GetIntegerValue parses the element as an INTEGER
+// Note: This implementation only handles unsigned integers (positive values)
+// which is sufficient for TEE certificates where all integer fields are positive
 func (e *ASN1Element) GetIntegerValue() uint64 {
 	if e.Tag != ASN1_INTEGER || e.Length == 0 {
 		return 0
