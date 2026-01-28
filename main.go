@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -76,9 +77,9 @@ func parseCertificateChain(data []byte, verbose bool) {
 		fmt.Printf("\n--- Certificate #%d (offset: %d, size: %d bytes) ---\n", certIndex, offset, len(certData))
 
 		if verbose {
-			// Print detailed ASN.1 structure
+			// Print detailed ASN.1 structure with field names
 			fmt.Printf("\n=== Detailed ASN.1 Field Dump ===\n")
-			dumpASN1Fields(certData, 0, 0)
+			dumpASN1FieldsWithNames(certData, 0, 0, []string{"Certificate"})
 			fmt.Printf("\n=== End of Detailed Dump ===\n\n")
 		}
 
@@ -400,6 +401,401 @@ func dumpASN1Fields(data []byte, offset int, depth int) int {
 	}
 
 	return elem.GetNextOffset()
+}
+
+// dumpASN1FieldsWithNames recursively dumps all ASN.1 fields with certificate field names
+func dumpASN1FieldsWithNames(data []byte, offset int, depth int, path []string) int {
+	if offset >= len(data) {
+		return offset
+	}
+
+	indent := ""
+	for i := 0; i < depth; i++ {
+		indent += "  "
+	}
+
+	elem, err := ParseASN1Element(data, offset)
+	if err != nil {
+		fmt.Printf("%s[ERROR at offset %d: %v]\n", indent, offset, err)
+		return len(data)
+	}
+
+	// Get field name based on path
+	fieldName := getFieldName(path, elem, offset, data)
+
+	// Print field information
+	tagClass := elem.GetTagClass()
+	tagClassStr := ""
+	switch tagClass {
+	case 0:
+		tagClassStr = "Universal"
+	case 1:
+		tagClassStr = "Application"
+	case 2:
+		tagClassStr = "Context"
+	case 3:
+		tagClassStr = "Private"
+	}
+
+	constructed := ""
+	if elem.IsConstructed() {
+		constructed = " CONSTRUCTED"
+	} else {
+		constructed = " PRIMITIVE"
+	}
+
+	// Get tag type description
+	tagType := getTagTypeName(elem.Tag, tagClass)
+
+	// Print with field name
+	if fieldName != "" {
+		fmt.Printf("%sOffset %04d: [%s%s] Tag=0x%02X (%s) Length=%d TagNumber=%d - Field: %s\n",
+			indent, offset, tagClassStr, constructed, elem.Tag, tagType, elem.Length, elem.TagNumber, fieldName)
+	} else {
+		fmt.Printf("%sOffset %04d: [%s%s] Tag=0x%02X (%s) Length=%d TagNumber=%d\n",
+			indent, offset, tagClassStr, constructed, elem.Tag, tagType, elem.Length, elem.TagNumber)
+	}
+
+	// Print content hex dump for primitive types
+	content := elem.GetContent()
+	if !elem.IsConstructed() && len(content) > 0 && len(content) <= 64 {
+		fmt.Printf("%s  Content (hex): ", indent)
+		for i, b := range content {
+			if i > 0 && i%16 == 0 {
+				fmt.Printf("\n%s                 ", indent)
+			}
+			fmt.Printf("%02X ", b)
+		}
+		fmt.Println()
+
+		// For printable strings, also show the text
+		if elem.Tag == ASN1_PRINTABLE_STRING || elem.Tag == ASN1_UTF8_STRING || elem.Tag == ASN1_IA5_STRING {
+			fmt.Printf("%s  Content (text): %s\n", indent, string(content))
+		} else if elem.Tag == ASN1_INTEGER && len(content) <= 8 {
+			fmt.Printf("%s  Content (int):  %d\n", indent, elem.GetIntegerValue())
+		} else if elem.Tag == ASN1_BOOLEAN {
+			fmt.Printf("%s  Content (bool): %v\n", indent, elem.GetBooleanValue())
+		} else if elem.Tag == ASN1_ENUMERATED {
+			fmt.Printf("%s  Content (enum): %d\n", indent, elem.GetEnumeratedValue())
+		}
+	} else if len(content) > 64 {
+		fmt.Printf("%s  Content: %d bytes (too large to display)\n", indent, len(content))
+		
+		// Try to parse OCTET STRING content as nested ASN.1
+		if elem.Tag == ASN1_OCTET_STRING && len(content) > 0 {
+			// Check if the first byte looks like a valid ASN.1 tag
+			if content[0] == ASN1_SEQUENCE || content[0] == ASN1_SET || 
+			   (content[0] & 0x1F) > 0 {
+				fmt.Printf("%s  > Parsing nested ASN.1 content:\n", indent)
+				nestedOffset := 0
+				nestedPath := append(path, fieldName)
+				for nestedOffset < len(content) {
+					nestedOffset = dumpASN1FieldsWithNames(content, nestedOffset, depth+1, nestedPath)
+					if nestedOffset >= len(content) {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Recursively parse constructed types
+	if elem.IsConstructed() {
+		currentOffset := elem.GetContentOffset()
+		endOffset := elem.GetNextOffset()
+		childIndex := 0
+		for currentOffset < endOffset {
+			newPath := append(path, fieldName)
+			if fieldName == "" {
+				newPath = path
+			}
+			// Add child index for tracking
+			newPath = append(newPath, fmt.Sprintf("[%d]", childIndex))
+			currentOffset = dumpASN1FieldsWithNames(data, currentOffset, depth+1, newPath)
+			if currentOffset >= endOffset {
+				break
+			}
+			childIndex++
+		}
+	}
+
+	return elem.GetNextOffset()
+}
+
+// getFieldName returns the certificate field name based on the path and context
+func getFieldName(path []string, elem *ASN1Element, offset int, data []byte) string {
+	if len(path) == 0 {
+		return ""
+	}
+
+	// Get the current level in the certificate structure
+	currentPath := path[len(path)-1]
+
+	// Certificate root structure
+	if currentPath == "Certificate" && elem.Tag == ASN1_SEQUENCE {
+		return "Certificate"
+	}
+
+	// Inside Certificate
+	if len(path) >= 2 && path[len(path)-2] == "Certificate" {
+		if currentPath == "[0]" && elem.Tag == ASN1_SEQUENCE {
+			return "TBSCertificate"
+		}
+		if currentPath == "[1]" && elem.Tag == ASN1_SEQUENCE {
+			return "SignatureAlgorithm"
+		}
+		if currentPath == "[2]" && elem.Tag == ASN1_BIT_STRING {
+			return "SignatureValue"
+		}
+	}
+
+	// Inside TBSCertificate
+	if len(path) >= 3 && path[len(path)-3] == "Certificate" && path[len(path)-2] == "[0]" {
+		tagClass := elem.GetTagClass()
+		if currentPath == "[0]" && tagClass == 2 && elem.TagNumber == 0 {
+			return "Version"
+		}
+		// Check if version is present by looking at the tag
+		versionPresent := false
+		if len(path) >= 4 && path[len(path)-4] == "Certificate" {
+			// Try to detect version by checking offset
+			firstElem, _ := ParseASN1Element(data, offset-offset) // This is a simplified check
+			if firstElem != nil && firstElem.GetTagClass() == 2 {
+				versionPresent = true
+			}
+		}
+		
+		baseIndex := 0
+		if versionPresent {
+			baseIndex = 1
+		}
+		
+		idx := parseChildIndex(currentPath)
+		if idx == baseIndex && elem.Tag == ASN1_INTEGER {
+			return "SerialNumber"
+		}
+		if idx == baseIndex+1 && elem.Tag == ASN1_SEQUENCE {
+			return "Signature"
+		}
+		if idx == baseIndex+2 && elem.Tag == ASN1_SEQUENCE {
+			return "Issuer"
+		}
+		if idx == baseIndex+3 && elem.Tag == ASN1_SEQUENCE {
+			return "Validity"
+		}
+		if idx == baseIndex+4 && elem.Tag == ASN1_SEQUENCE {
+			return "Subject"
+		}
+		if idx == baseIndex+5 && elem.Tag == ASN1_SEQUENCE {
+			return "SubjectPublicKeyInfo"
+		}
+		if tagClass == 2 && elem.TagNumber == 3 {
+			return "Extensions"
+		}
+	}
+
+	// Inside Validity
+	if len(path) >= 2 && (path[len(path)-2] == "Validity" || 
+	   (len(path) >= 3 && path[len(path)-3] == "Validity")) {
+		if currentPath == "[0]" && (elem.Tag == ASN1_UTCTIME || elem.Tag == ASN1_GENERALIZEDTIME) {
+			return "NotBefore"
+		}
+		if currentPath == "[1]" && (elem.Tag == ASN1_UTCTIME || elem.Tag == ASN1_GENERALIZEDTIME) {
+			return "NotAfter"
+		}
+	}
+
+	// Inside Issuer or Subject (Name)
+	if len(path) >= 2 && (path[len(path)-2] == "Issuer" || path[len(path)-2] == "Subject") {
+		if elem.Tag == ASN1_SET {
+			return "RDN (Relative Distinguished Name)"
+		}
+	}
+
+	// Inside RDN - AttributeTypeAndValue
+	if len(path) >= 3 && strings.Contains(path[len(path)-2], "RDN") {
+		if elem.Tag == ASN1_SEQUENCE {
+			return "AttributeTypeAndValue"
+		}
+	}
+
+	// Inside AttributeTypeAndValue
+	if len(path) >= 2 && strings.Contains(path[len(path)-2], "AttributeTypeAndValue") {
+		if currentPath == "[0]" && elem.Tag == ASN1_OBJECT_IDENTIFIER {
+			return "AttributeType (OID)"
+		}
+		if currentPath == "[1]" {
+			// Read OID to determine attribute name
+			if offset >= 2 {
+				return "AttributeValue"
+			}
+		}
+	}
+
+	// SubjectPublicKeyInfo
+	if len(path) >= 2 && path[len(path)-2] == "SubjectPublicKeyInfo" {
+		if currentPath == "[0]" && elem.Tag == ASN1_SEQUENCE {
+			return "Algorithm"
+		}
+		if currentPath == "[1]" && elem.Tag == ASN1_BIT_STRING {
+			return "SubjectPublicKey"
+		}
+	}
+
+	// Extensions
+	if len(path) >= 2 && path[len(path)-2] == "Extensions" {
+		if elem.Tag == ASN1_SEQUENCE {
+			return "Extensions (SEQUENCE)"
+		}
+	}
+
+	if len(path) >= 3 && strings.Contains(path[len(path)-3], "Extensions") {
+		if elem.Tag == ASN1_SEQUENCE {
+			return "Extension"
+		}
+	}
+
+	// Inside Extension
+	if len(path) >= 2 && path[len(path)-2] == "Extension" {
+		if currentPath == "[0]" && elem.Tag == ASN1_OBJECT_IDENTIFIER {
+			return "ExtensionID (OID)"
+		}
+		if currentPath == "[1]" && elem.Tag == ASN1_BOOLEAN {
+			return "Critical"
+		}
+		if elem.Tag == ASN1_OCTET_STRING {
+			return "ExtensionValue"
+		}
+	}
+
+	// TEE Attestation Extension (nested in OCTET STRING)
+	// When we're at offset 0 of a nested parse and it's a SEQUENCE, and the parent was ExtensionValue
+	if offset == 0 && elem.Tag == ASN1_SEQUENCE {
+		for i := len(path) - 1; i >= 0; i-- {
+			if strings.Contains(path[i], "ExtensionValue") {
+				return "KeyDescription (Attestation Record)"
+			}
+		}
+	}
+
+	// Inside KeyDescription
+	if len(path) >= 2 && strings.Contains(path[len(path)-2], "KeyDescription") {
+		idx := parseChildIndex(currentPath)
+		if idx == 0 && elem.Tag == ASN1_INTEGER {
+			return "AttestationVersion"
+		}
+		if idx == 1 && elem.Tag == ASN1_ENUMERATED {
+			return "AttestationSecurityLevel"
+		}
+		if idx == 2 && elem.Tag == ASN1_INTEGER {
+			return "KeymasterVersion"
+		}
+		if idx == 3 && elem.Tag == ASN1_ENUMERATED {
+			return "KeymasterSecurityLevel"
+		}
+		if idx == 4 && elem.Tag == ASN1_OCTET_STRING {
+			return "AttestationChallenge"
+		}
+		if idx == 5 && elem.Tag == ASN1_OCTET_STRING {
+			return "UniqueId"
+		}
+		if idx == 6 && elem.Tag == ASN1_SEQUENCE {
+			return "SoftwareEnforced (AuthorizationList)"
+		}
+		if idx == 7 && elem.Tag == ASN1_SEQUENCE {
+			return "TeeEnforced (AuthorizationList)"
+		}
+	}
+
+	// Inside AuthorizationList - check if we're in the path that leads to AuthorizationList
+	for i := len(path) - 1; i >= 0; i-- {
+		if strings.Contains(path[i], "SoftwareEnforced") || strings.Contains(path[i], "TeeEnforced") || strings.Contains(path[i], "AuthorizationList") {
+			tagClass := elem.GetTagClass()
+			if tagClass == 2 { // Context tags
+				return getKeymasterTagName(int(elem.TagNumber))
+			}
+			break
+		}
+	}
+
+	return ""
+}
+
+// parseChildIndex extracts the numeric index from a path component like "[0]"
+func parseChildIndex(s string) int {
+	if len(s) >= 3 && s[0] == '[' && s[len(s)-1] == ']' {
+		var idx int
+		fmt.Sscanf(s, "[%d]", &idx)
+		return idx
+	}
+	return -1
+}
+
+// getKeymasterTagName returns the Keymaster tag name for a given tag number
+func getKeymasterTagName(tagNumber int) string {
+	// Keymaster tag numbers (from Android documentation)
+	switch tagNumber {
+	case 1:
+		return "KM_TAG_PURPOSE"
+	case 2:
+		return "KM_TAG_ALGORITHM"
+	case 3:
+		return "KM_TAG_KEY_SIZE"
+	case 4:
+		return "KM_TAG_BLOCK_MODE"
+	case 5:
+		return "KM_TAG_DIGEST"
+	case 6:
+		return "KM_TAG_PADDING"
+	case 10:
+		return "KM_TAG_EC_CURVE"
+	case 200:
+		return "KM_TAG_RSA_PUBLIC_EXPONENT"
+	case 303:
+		return "KM_TAG_ROLLBACK_RESISTANCE"
+	case 503:
+		return "KM_TAG_BOOTLOADER_ONLY"
+	case 504:
+		return "KM_TAG_ACTIVE_DATETIME"
+	case 505:
+		return "KM_TAG_ORIGINATION_EXPIRE_DATETIME"
+	case 506:
+		return "KM_TAG_USAGE_EXPIRE_DATETIME"
+	case 701:
+		return "KM_TAG_CREATION_DATETIME"
+	case 702:
+		return "KM_TAG_ORIGIN"
+	case 704:
+		return "KM_TAG_ROOT_OF_TRUST"
+	case 705:
+		return "KM_TAG_OS_VERSION"
+	case 706:
+		return "KM_TAG_OS_PATCHLEVEL"
+	case 709:
+		return "KM_TAG_ATTESTATION_APPLICATION_ID"
+	case 710:
+		return "KM_TAG_ATTESTATION_ID_BRAND"
+	case 711:
+		return "KM_TAG_ATTESTATION_ID_DEVICE"
+	case 712:
+		return "KM_TAG_ATTESTATION_ID_PRODUCT"
+	case 713:
+		return "KM_TAG_ATTESTATION_ID_SERIAL"
+	case 714:
+		return "KM_TAG_ATTESTATION_ID_IMEI"
+	case 715:
+		return "KM_TAG_ATTESTATION_ID_MEID"
+	case 716:
+		return "KM_TAG_ATTESTATION_ID_MANUFACTURER"
+	case 717:
+		return "KM_TAG_ATTESTATION_ID_MODEL"
+	case 718:
+		return "KM_TAG_VENDOR_PATCHLEVEL"
+	case 719:
+		return "KM_TAG_BOOT_PATCHLEVEL"
+	default:
+		return fmt.Sprintf("KM_TAG_%d", tagNumber)
+	}
 }
 
 // getTagTypeName returns a human-readable name for an ASN.1 tag
