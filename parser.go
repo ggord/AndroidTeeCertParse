@@ -542,16 +542,22 @@ func parseName(data []byte, nameSeq *ASN1Element) Name {
 		oid := oidElem.GetContent()
 		switch {
 		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x03:
+			// OID 2.5.4.3 - commonName (CN)
 			name.CommonName = value
 		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x0a:
+			// OID 2.5.4.10 - organizationName (O)
 			name.Organization = value
 		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x0b:
+			// OID 2.5.4.11 - organizationalUnitName (OU)
 			name.OrganizationalUnit = value
 		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x06:
+			// OID 2.5.4.6 - countryName (C)
 			name.Country = value
 		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x08:
+			// OID 2.5.4.8 - stateOrProvinceName (ST)
 			name.State = value
 		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x07:
+			// OID 2.5.4.7 - localityName (L)
 			name.Locality = value
 		}
 
@@ -571,13 +577,17 @@ func parseValidity(data []byte, validitySeq *ASN1Element) Validity {
 	notBeforeElem, err := ParseASN1Element(data, currentOffset)
 	if err == nil && (notBeforeElem.Tag == ASN1_UTCTIME || notBeforeElem.Tag == ASN1_GENERALIZEDTIME) {
 		validity.NotBefore = string(notBeforeElem.GetContent())
+	}
+	if err == nil {
 		currentOffset = notBeforeElem.GetNextOffset()
 	}
 
 	// Parse notAfter
-	notAfterElem, err := ParseASN1Element(data, currentOffset)
-	if err == nil && (notAfterElem.Tag == ASN1_UTCTIME || notAfterElem.Tag == ASN1_GENERALIZEDTIME) {
-		validity.NotAfter = string(notAfterElem.GetContent())
+	if currentOffset < validitySeq.GetNextOffset() {
+		notAfterElem, err := ParseASN1Element(data, currentOffset)
+		if err == nil && (notAfterElem.Tag == ASN1_UTCTIME || notAfterElem.Tag == ASN1_GENERALIZEDTIME) {
+			validity.NotAfter = string(notAfterElem.GetContent())
+		}
 	}
 
 	return validity
@@ -607,6 +617,7 @@ func parsePublicKeyInfo(data []byte, pkiSeq *ASN1Element) PublicKeyInfo {
 
 	// Identify common algorithms
 	oid := oidElem.GetContent()
+	// OID 1.2.840.10045.2.1 - ecPublicKey
 	if len(oid) == 7 && oid[0] == 0x2a && oid[1] == 0x86 && oid[2] == 0x48 && oid[3] == 0xce && oid[4] == 0x3d && oid[5] == 0x02 && oid[6] == 0x01 {
 		pki.Algorithm = "EC"
 		
@@ -616,7 +627,7 @@ func parsePublicKeyInfo(data []byte, pkiSeq *ASN1Element) PublicKeyInfo {
 			paramElem, err := ParseASN1Element(data, paramOffset)
 			if err == nil && paramElem.Tag == ASN1_OBJECT_IDENTIFIER {
 				curveOid := paramElem.GetContent()
-				// Check for P-256 (1.2.840.10045.3.1.7)
+				// OID 1.2.840.10045.3.1.7 - secp256r1 (P-256)
 				if len(curveOid) == 8 && curveOid[0] == 0x2a && curveOid[1] == 0x86 && curveOid[2] == 0x48 && curveOid[3] == 0xce && curveOid[4] == 0x3d && curveOid[5] == 0x03 && curveOid[6] == 0x01 && curveOid[7] == 0x07 {
 					pki.Algorithm = "EC (P-256)"
 					pki.KeySize = 256
@@ -624,17 +635,18 @@ func parsePublicKeyInfo(data []byte, pkiSeq *ASN1Element) PublicKeyInfo {
 			}
 		}
 	} else if len(oid) == 9 && oid[0] == 0x2a && oid[1] == 0x86 && oid[2] == 0x48 && oid[3] == 0x86 && oid[4] == 0xf7 && oid[5] == 0x0d && oid[6] == 0x01 && oid[7] == 0x01 {
-		// RSA encryption OIDs
+		// OID 1.2.840.113549.1.1.x - RSA encryption
 		if oid[8] == 0x01 {
 			pki.Algorithm = "RSA"
 		}
 		
-		// Parse public key BIT STRING to get key size
+		// Note: Accurate RSA key size calculation would require parsing the BIT STRING content
+		// to extract the modulus from the SubjectPublicKeyInfo SEQUENCE. For simplicity,
+		// we provide an approximate size based on the BIT STRING length.
 		keyOffset := algSeq.GetNextOffset()
 		keyElem, err := ParseASN1Element(data, keyOffset)
 		if err == nil && keyElem.Tag == ASN1_BIT_STRING {
-			// For RSA, the key size can be estimated from the bit string length
-			// This is approximate but good enough for display
+			// Approximate key size for display purposes
 			pki.KeySize = int(keyElem.Length) * 8
 		}
 	}
