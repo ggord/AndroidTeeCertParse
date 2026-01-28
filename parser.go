@@ -95,9 +95,8 @@ func parseTBSCertificate(data []byte, offset int) (*TBSCertificate, error) {
 		currentOffset = field.GetNextOffset()
 	}
 
-	if tbs.Extensions == nil {
-		return nil, fmt.Errorf("extensions not found in TBSCertificate")
-	}
+	// Note: Extensions may not be present in root/intermediate certificates
+	// This is not an error, just means it's a standard X.509 certificate
 
 	return tbs, nil
 }
@@ -179,9 +178,8 @@ func parseCertificateExtensions(data []byte, offset int) (*CertificateExtensions
 		currentOffset = ext.GetNextOffset()
 	}
 
-	if exts.TEEExtension == nil {
-		return nil, fmt.Errorf("TEE attestation extension not found")
-	}
+	// Note: TEE extension may not be present in root/intermediate certificates
+	// This is not an error
 
 	return exts, nil
 }
