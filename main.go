@@ -14,6 +14,7 @@ func main() {
 		"assests/cert_oneplus.bin",
 		// "assests/cert_pixel4.bin",
 		// "assests/cert_pixel6.bin",
+		// Note: cert_xiaomi6x.bin has format issues in original data
 		// "assests/cert_xiaomi6x.bin",
 	}
 
