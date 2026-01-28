@@ -69,9 +69,37 @@ type CertificateExtensions struct {
 	TEEExtension *TEEAttestationExtension
 }
 
+// Name represents a Distinguished Name (DN)
+type Name struct {
+	CommonName         string
+	Organization       string
+	OrganizationalUnit string
+	Country            string
+	State              string
+	Locality           string
+}
+
+// Validity represents the validity period
+type Validity struct {
+	NotBefore string
+	NotAfter  string
+}
+
+// PublicKeyInfo represents public key information
+type PublicKeyInfo struct {
+	Algorithm string
+	KeySize   int
+}
+
 // TBSCertificate represents the "To Be Signed" certificate
 type TBSCertificate struct {
-	Extensions *CertificateExtensions
+	Version      int
+	SerialNumber []byte
+	Issuer       Name
+	Subject      Name
+	Validity     Validity
+	PublicKey    PublicKeyInfo
+	Extensions   *CertificateExtensions
 }
 
 // X509Certificate represents the X.509 certificate
