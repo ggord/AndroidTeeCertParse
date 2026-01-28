@@ -82,7 +82,7 @@ func parseCertificateChain(data []byte) {
 			continue
 		}
 
-		printCertificateInfo(cert, certIndex)
+		printCertificateInfo(cert)
 
 		// Move to next certificate
 		offset = elem.GetNextOffset()
@@ -101,10 +101,10 @@ func parseCertFromFile(certPath string) {
 		return
 	}
 
-	printCertificateInfo(cert, 1)
+	printCertificateInfo(cert)
 }
 
-func printCertificateInfo(cert *TeeCert, certIndex int) {
+func printCertificateInfo(cert *TeeCert) {
 	fmt.Println("[Native-TEE] Certificate parsed successfully!")
 
 	// Get attestation record with nil checks
