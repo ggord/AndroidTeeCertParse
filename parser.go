@@ -70,10 +70,11 @@ func parseTBSCertificate(data []byte, offset int) (*TBSCertificate, error) {
 
 	tbs := &TBSCertificate{}
 
-	// Navigate through TBSCertificate fields to find Extensions
+	// Navigate through TBSCertificate fields
 	// Structure: [version] serialNumber signature issuer validity subject subjectPublicKeyInfo [extensions]
 	currentOffset := elem.GetContentOffset()
 	endOffset := elem.GetNextOffset()
+	fieldIndex := 0
 
 	for currentOffset < endOffset {
 		field, err := ParseASN1Element(data, currentOffset)
@@ -81,22 +82,90 @@ func parseTBSCertificate(data []byte, offset int) (*TBSCertificate, error) {
 			return nil, err
 		}
 
-		// Check if this is the Extensions field (CONTEXT[3])
+		// Handle optional version field (CONTEXT[0])
+		if fieldIndex == 0 && field.GetTagClass() == 2 && field.TagNumber == 0 {
+			// Parse version
+			versionOffset := field.GetContentOffset()
+			versionElem, err := ParseASN1Element(data, versionOffset)
+			if err == nil && versionElem.Tag == ASN1_INTEGER {
+				tbs.Version = int(versionElem.GetIntegerValue())
+			}
+			currentOffset = field.GetNextOffset()
+			fieldIndex++
+			continue
+		}
+
+		// Serial Number (INTEGER)
+		if fieldIndex == 0 || fieldIndex == 1 {
+			if field.Tag == ASN1_INTEGER {
+				tbs.SerialNumber = field.GetContent()
+				currentOffset = field.GetNextOffset()
+				fieldIndex = 2
+				continue
+			}
+		}
+
+		// Signature Algorithm (SEQUENCE) - skip for now
+		if fieldIndex == 2 {
+			if field.Tag == ASN1_SEQUENCE {
+				currentOffset = field.GetNextOffset()
+				fieldIndex = 3
+				continue
+			}
+		}
+
+		// Issuer (SEQUENCE)
+		if fieldIndex == 3 {
+			if field.Tag == ASN1_SEQUENCE {
+				tbs.Issuer = parseName(data, field)
+				currentOffset = field.GetNextOffset()
+				fieldIndex = 4
+				continue
+			}
+		}
+
+		// Validity (SEQUENCE)
+		if fieldIndex == 4 {
+			if field.Tag == ASN1_SEQUENCE {
+				tbs.Validity = parseValidity(data, field)
+				currentOffset = field.GetNextOffset()
+				fieldIndex = 5
+				continue
+			}
+		}
+
+		// Subject (SEQUENCE)
+		if fieldIndex == 5 {
+			if field.Tag == ASN1_SEQUENCE {
+				tbs.Subject = parseName(data, field)
+				currentOffset = field.GetNextOffset()
+				fieldIndex = 6
+				continue
+			}
+		}
+
+		// SubjectPublicKeyInfo (SEQUENCE)
+		if fieldIndex == 6 {
+			if field.Tag == ASN1_SEQUENCE {
+				tbs.PublicKey = parsePublicKeyInfo(data, field)
+				currentOffset = field.GetNextOffset()
+				fieldIndex = 7
+				continue
+			}
+		}
+
+		// Extensions (CONTEXT[3])
 		if field.GetTagClass() == 2 && field.TagNumber == 3 {
-			// Found Extensions
 			extensions, err := parseCertificateExtensions(data, field.GetContentOffset())
 			if err != nil {
-				return nil, fmt.Errorf("failed to parse extensions: %v", err)
+				log.Printf("Warning: failed to parse extensions: %v", err)
+			} else {
+				tbs.Extensions = extensions
 			}
-			tbs.Extensions = extensions
-			break
 		}
 
 		currentOffset = field.GetNextOffset()
 	}
-
-	// Note: Extensions may not be present in root/intermediate certificates
-	// This is not an error, just means it's a standard X.509 certificate
 
 	return tbs, nil
 }
@@ -421,4 +490,154 @@ func parseOrigin(data []byte, tag *ASN1Element, authList *AuthorizationList) {
 	if err == nil && intElem.Tag == ASN1_INTEGER {
 		authList.Origin = uint32(intElem.GetIntegerValue())
 	}
+}
+
+// parseName parses a Distinguished Name (DN) from a SEQUENCE
+func parseName(data []byte, nameSeq *ASN1Element) Name {
+	name := Name{}
+	
+	currentOffset := nameSeq.GetContentOffset()
+	endOffset := nameSeq.GetNextOffset()
+
+	for currentOffset < endOffset {
+		// Each name component is a SET
+		setElem, err := ParseASN1Element(data, currentOffset)
+		if err != nil || setElem.Tag != ASN1_SET {
+			currentOffset = setElem.GetNextOffset()
+			continue
+		}
+
+		// Parse the SEQUENCE inside the SET
+		seqOffset := setElem.GetContentOffset()
+		seqElem, err := ParseASN1Element(data, seqOffset)
+		if err != nil || seqElem.Tag != ASN1_SEQUENCE {
+			currentOffset = setElem.GetNextOffset()
+			continue
+		}
+
+		// Parse OID and value
+		oidOffset := seqElem.GetContentOffset()
+		oidElem, err := ParseASN1Element(data, oidOffset)
+		if err != nil || oidElem.Tag != ASN1_OBJECT_IDENTIFIER {
+			currentOffset = setElem.GetNextOffset()
+			continue
+		}
+
+		// Get the value (usually a string)
+		valueOffset := oidElem.GetNextOffset()
+		valueElem, err := ParseASN1Element(data, valueOffset)
+		if err != nil {
+			currentOffset = setElem.GetNextOffset()
+			continue
+		}
+
+		// Convert value to string
+		var value string
+		switch valueElem.Tag {
+		case ASN1_PRINTABLE_STRING, ASN1_UTF8_STRING, ASN1_IA5_STRING:
+			value = string(valueElem.GetContent())
+		}
+
+		// Map OID to field
+		oid := oidElem.GetContent()
+		switch {
+		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x03:
+			name.CommonName = value
+		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x0a:
+			name.Organization = value
+		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x0b:
+			name.OrganizationalUnit = value
+		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x06:
+			name.Country = value
+		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x08:
+			name.State = value
+		case len(oid) == 3 && oid[0] == 0x55 && oid[1] == 0x04 && oid[2] == 0x07:
+			name.Locality = value
+		}
+
+		currentOffset = setElem.GetNextOffset()
+	}
+
+	return name
+}
+
+// parseValidity parses the Validity structure
+func parseValidity(data []byte, validitySeq *ASN1Element) Validity {
+	validity := Validity{}
+
+	currentOffset := validitySeq.GetContentOffset()
+
+	// Parse notBefore
+	notBeforeElem, err := ParseASN1Element(data, currentOffset)
+	if err == nil && (notBeforeElem.Tag == ASN1_UTCTIME || notBeforeElem.Tag == ASN1_GENERALIZEDTIME) {
+		validity.NotBefore = string(notBeforeElem.GetContent())
+		currentOffset = notBeforeElem.GetNextOffset()
+	}
+
+	// Parse notAfter
+	notAfterElem, err := ParseASN1Element(data, currentOffset)
+	if err == nil && (notAfterElem.Tag == ASN1_UTCTIME || notAfterElem.Tag == ASN1_GENERALIZEDTIME) {
+		validity.NotAfter = string(notAfterElem.GetContent())
+	}
+
+	return validity
+}
+
+// parsePublicKeyInfo parses the SubjectPublicKeyInfo structure
+func parsePublicKeyInfo(data []byte, pkiSeq *ASN1Element) PublicKeyInfo {
+	pki := PublicKeyInfo{
+		Algorithm: "Unknown",
+		KeySize:   0,
+	}
+
+	currentOffset := pkiSeq.GetContentOffset()
+
+	// Parse algorithm (SEQUENCE)
+	algSeq, err := ParseASN1Element(data, currentOffset)
+	if err != nil || algSeq.Tag != ASN1_SEQUENCE {
+		return pki
+	}
+
+	// Parse algorithm OID
+	oidOffset := algSeq.GetContentOffset()
+	oidElem, err := ParseASN1Element(data, oidOffset)
+	if err != nil || oidElem.Tag != ASN1_OBJECT_IDENTIFIER {
+		return pki
+	}
+
+	// Identify common algorithms
+	oid := oidElem.GetContent()
+	if len(oid) == 7 && oid[0] == 0x2a && oid[1] == 0x86 && oid[2] == 0x48 && oid[3] == 0xce && oid[4] == 0x3d && oid[5] == 0x02 && oid[6] == 0x01 {
+		pki.Algorithm = "EC"
+		
+		// Parse EC parameters to get curve info
+		paramOffset := oidElem.GetNextOffset()
+		if paramOffset < algSeq.GetNextOffset() {
+			paramElem, err := ParseASN1Element(data, paramOffset)
+			if err == nil && paramElem.Tag == ASN1_OBJECT_IDENTIFIER {
+				curveOid := paramElem.GetContent()
+				// Check for P-256 (1.2.840.10045.3.1.7)
+				if len(curveOid) == 8 && curveOid[0] == 0x2a && curveOid[1] == 0x86 && curveOid[2] == 0x48 && curveOid[3] == 0xce && curveOid[4] == 0x3d && curveOid[5] == 0x03 && curveOid[6] == 0x01 && curveOid[7] == 0x07 {
+					pki.Algorithm = "EC (P-256)"
+					pki.KeySize = 256
+				}
+			}
+		}
+	} else if len(oid) == 9 && oid[0] == 0x2a && oid[1] == 0x86 && oid[2] == 0x48 && oid[3] == 0x86 && oid[4] == 0xf7 && oid[5] == 0x0d && oid[6] == 0x01 && oid[7] == 0x01 {
+		// RSA encryption OIDs
+		if oid[8] == 0x01 {
+			pki.Algorithm = "RSA"
+		}
+		
+		// Parse public key BIT STRING to get key size
+		keyOffset := algSeq.GetNextOffset()
+		keyElem, err := ParseASN1Element(data, keyOffset)
+		if err == nil && keyElem.Tag == ASN1_BIT_STRING {
+			// For RSA, the key size can be estimated from the bit string length
+			// This is approximate but good enough for display
+			pki.KeySize = int(keyElem.Length) * 8
+		}
+	}
+
+	return pki
 }
