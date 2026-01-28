@@ -1,3 +1,6 @@
 /.idea/
 /cmake-build-debug/
-main.o
+/cpp_backup/
+AndroidTeeCertParse
+*.o
+*.exe
