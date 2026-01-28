@@ -11,11 +11,12 @@ import (
 func main() {
 	// Parse command-line flags
 	hexStr := flag.String("hex", "", "Hex string of certificate to parse")
+	verbose := flag.Bool("verbose", false, "Enable verbose field-by-field parsing output")
 	flag.Parse()
 
 	// If hex string provided, parse it
 	if *hexStr != "" {
-		parseCertFromHex(*hexStr)
+		parseCertFromHex(*hexStr, *verbose)
 		os.Exit(0)
 	}
 
@@ -31,14 +32,14 @@ func main() {
 	}
 
 	for _, certPath := range certPaths {
-		parseCertFromFile(certPath)
+		parseCertFromFile(certPath, *verbose)
 	}
 
 	fmt.Printf("\n======================\n")
 	os.Exit(0)
 }
 
-func parseCertFromHex(hexStr string) {
+func parseCertFromHex(hexStr string, verbose bool) {
 	fmt.Printf("\n======================\n")
 	fmt.Printf("Parsing certificate from hex string\n")
 	fmt.Printf("======================\n")
@@ -50,10 +51,10 @@ func parseCertFromHex(hexStr string) {
 	}
 
 	// Parse certificate chain (may contain multiple certificates)
-	parseCertificateChain(data)
+	parseCertificateChain(data, verbose)
 }
 
-func parseCertificateChain(data []byte) {
+func parseCertificateChain(data []byte, verbose bool) {
 	offset := 0
 	certIndex := 1
 
@@ -74,6 +75,13 @@ func parseCertificateChain(data []byte) {
 
 		fmt.Printf("\n--- Certificate #%d (offset: %d, size: %d bytes) ---\n", certIndex, offset, len(certData))
 
+		if verbose {
+			// Print detailed ASN.1 structure
+			fmt.Printf("\n=== Detailed ASN.1 Field Dump ===\n")
+			dumpASN1Fields(certData, 0, 0)
+			fmt.Printf("\n=== End of Detailed Dump ===\n\n")
+		}
+
 		cert, err := NewTeeCert(certData)
 		if err != nil {
 			log.Printf("[Native-TEE] Error: Failed to parse certificate #%d: %v", certIndex, err)
@@ -90,10 +98,24 @@ func parseCertificateChain(data []byte) {
 	}
 }
 
-func parseCertFromFile(certPath string) {
+func parseCertFromFile(certPath string, verbose bool) {
 	fmt.Printf("\n======================\n")
 	fmt.Printf("Parsing certificate: %s\n", certPath)
 	fmt.Printf("======================\n")
+
+	// Read file data
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		log.Printf("[Native-TEE] Error: Invalid certificate file or parsing failed: %v", err)
+		return
+	}
+
+	if verbose {
+		// Print detailed ASN.1 structure
+		fmt.Printf("\n=== Detailed ASN.1 Field Dump ===\n")
+		dumpASN1Fields(data, 0, 0)
+		fmt.Printf("\n=== End of Detailed Dump ===\n\n")
+	}
 
 	cert, err := NewTeeCertFromFile(certPath)
 	if err != nil {
@@ -276,5 +298,150 @@ func printDistinguishedName(label string, name Name) {
 	}
 	if name.Locality != "" {
 		fmt.Printf("  L (Locality): %s\n", name.Locality)
+	}
+}
+
+// dumpASN1Fields recursively dumps all ASN.1 fields with detailed information
+func dumpASN1Fields(data []byte, offset int, depth int) int {
+	if offset >= len(data) {
+		return offset
+	}
+
+	indent := ""
+	for i := 0; i < depth; i++ {
+		indent += "  "
+	}
+
+	elem, err := ParseASN1Element(data, offset)
+	if err != nil {
+		fmt.Printf("%s[ERROR at offset %d: %v]\n", indent, offset, err)
+		return len(data)
+	}
+
+	// Print field information
+	tagClass := elem.GetTagClass()
+	tagClassStr := ""
+	switch tagClass {
+	case 0:
+		tagClassStr = "Universal"
+	case 1:
+		tagClassStr = "Application"
+	case 2:
+		tagClassStr = "Context"
+	case 3:
+		tagClassStr = "Private"
+	}
+
+	constructed := ""
+	if elem.IsConstructed() {
+		constructed = " CONSTRUCTED"
+	} else {
+		constructed = " PRIMITIVE"
+	}
+
+	// Get tag type description
+	tagType := getTagTypeName(elem.Tag, tagClass)
+
+	fmt.Printf("%sOffset %04d: [%s%s] Tag=0x%02X (%s) Length=%d TagNumber=%d\n",
+		indent, offset, tagClassStr, constructed, elem.Tag, tagType, elem.Length, elem.TagNumber)
+
+	// Print content hex dump for primitive types
+	content := elem.GetContent()
+	if !elem.IsConstructed() && len(content) > 0 && len(content) <= 64 {
+		fmt.Printf("%s  Content (hex): ", indent)
+		for i, b := range content {
+			if i > 0 && i%16 == 0 {
+				fmt.Printf("\n%s                 ", indent)
+			}
+			fmt.Printf("%02X ", b)
+		}
+		fmt.Println()
+
+		// For printable strings, also show the text
+		if elem.Tag == ASN1_PRINTABLE_STRING || elem.Tag == ASN1_UTF8_STRING || elem.Tag == ASN1_IA5_STRING {
+			fmt.Printf("%s  Content (text): %s\n", indent, string(content))
+		} else if elem.Tag == ASN1_INTEGER && len(content) <= 8 {
+			fmt.Printf("%s  Content (int):  %d\n", indent, elem.GetIntegerValue())
+		} else if elem.Tag == ASN1_BOOLEAN {
+			fmt.Printf("%s  Content (bool): %v\n", indent, elem.GetBooleanValue())
+		} else if elem.Tag == ASN1_ENUMERATED {
+			fmt.Printf("%s  Content (enum): %d\n", indent, elem.GetEnumeratedValue())
+		}
+	} else if len(content) > 64 {
+		fmt.Printf("%s  Content: %d bytes (too large to display)\n", indent, len(content))
+		
+		// Try to parse OCTET STRING content as nested ASN.1
+		if elem.Tag == ASN1_OCTET_STRING && len(content) > 0 {
+			// Check if the first byte looks like a valid ASN.1 tag
+			if content[0] == ASN1_SEQUENCE || content[0] == ASN1_SET || 
+			   (content[0] & 0x1F) > 0 {
+				fmt.Printf("%s  > Parsing nested ASN.1 content:\n", indent)
+				nestedOffset := 0
+				for nestedOffset < len(content) {
+					nestedOffset = dumpASN1Fields(content, nestedOffset, depth+1)
+					if nestedOffset >= len(content) {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Recursively parse constructed types
+	if elem.IsConstructed() {
+		currentOffset := elem.GetContentOffset()
+		endOffset := elem.GetNextOffset()
+		for currentOffset < endOffset {
+			currentOffset = dumpASN1Fields(data, currentOffset, depth+1)
+			if currentOffset >= endOffset {
+				break
+			}
+		}
+	}
+
+	return elem.GetNextOffset()
+}
+
+// getTagTypeName returns a human-readable name for an ASN.1 tag
+func getTagTypeName(tag byte, tagClass byte) string {
+	if tagClass == 0 { // Universal
+		switch tag {
+		case ASN1_BOOLEAN:
+			return "BOOLEAN"
+		case ASN1_INTEGER:
+			return "INTEGER"
+		case ASN1_BIT_STRING:
+			return "BIT STRING"
+		case ASN1_OCTET_STRING:
+			return "OCTET STRING"
+		case ASN1_NULL:
+			return "NULL"
+		case ASN1_OBJECT_IDENTIFIER:
+			return "OBJECT IDENTIFIER"
+		case ASN1_ENUMERATED:
+			return "ENUMERATED"
+		case ASN1_UTF8_STRING:
+			return "UTF8String"
+		case ASN1_PRINTABLE_STRING:
+			return "PrintableString"
+		case ASN1_IA5_STRING:
+			return "IA5String"
+		case ASN1_UTCTIME:
+			return "UTCTime"
+		case ASN1_GENERALIZEDTIME:
+			return "GeneralizedTime"
+		case ASN1_SEQUENCE:
+			return "SEQUENCE"
+		case ASN1_SET:
+			return "SET"
+		default:
+			return fmt.Sprintf("Universal-%d", tag&0x1F)
+		}
+	} else if tagClass == 2 { // Context
+		return fmt.Sprintf("Context[%d]", tag&0x1F)
+	} else if tagClass == 1 { // Application
+		return fmt.Sprintf("Application[%d]", tag&0x1F)
+	} else { // Private
+		return fmt.Sprintf("Private[%d]", tag&0x1F)
 	}
 }
