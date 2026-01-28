@@ -18,13 +18,25 @@ go build -o AndroidTeeCertParse
 
 ### 运行
 
+#### 从文件解析证书
+
 ```bash
 ./AndroidTeeCertParse
 ```
 
 程序将解析 `assests/cert_oneplus.bin` 等测试证书文件，输出设备安全信息。
 
+#### 从十六进制字符串解析证书
+
+```bash
+./AndroidTeeCertParse -hex "3082028b30820232a00302010202090..."
+```
+
+程序将解析十六进制字符串中的证书数据。支持证书链解析（多个证书连接在一起）。
+
 ### 输出示例
+
+#### 文件解析输出
 
 ```
 ======================
@@ -40,6 +52,31 @@ OSVersion (TEE Enforced): 150000
 OSPatchLevel (TEE Enforced): 202503
 BootPatchLevel (TEE Enforced): 20250301
 ======================
+```
+
+#### 十六进制字符串解析输出
+
+```
+======================
+Parsing certificate from hex string
+======================
+
+--- Certificate #1 (offset: 0, size: 655 bytes) ---
+[Native-TEE] Certificate parsed successfully!
+[Native-TEE] Note: This is a standard X.509 certificate without TEE attestation extension (likely root/intermediate certificate)
+
+--- Certificate #2 (offset: 655, size: 636 bytes) ---
+[Native-TEE] Certificate parsed successfully!
+[Native-TEE] Note: This is a standard X.509 certificate without TEE attestation extension (likely root/intermediate certificate)
+
+--- Certificate #3 (offset: 1291, size: 692 bytes) ---
+[Native-TEE] Certificate parsed successfully!
+KeymasterSecurityLevel: 0
+device_locked: false
+verified_boot_key size: 0
+verified_boot_state: 0
+OSVersion (Software Enforced): 90000
+OSPatchLevel (Software Enforced): 201907
 ```
 
 ## 项目链接
