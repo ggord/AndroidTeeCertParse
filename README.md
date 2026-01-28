@@ -2,9 +2,45 @@
 
 ---
 
+**注意：本项目已从 C++ 转换为 Go 语言实现**
+
 ## 前言
 
 本人正在找工作，跪求大佬捞我（看似释然，实则没招了）邮箱：liuxingzuo@outlook.com
+
+## 快速开始
+
+### 编译
+
+```bash
+go build -o AndroidTeeCertParse
+```
+
+### 运行
+
+```bash
+./AndroidTeeCertParse
+```
+
+程序将解析 `assests/cert_oneplus.bin` 等测试证书文件，输出设备安全信息。
+
+### 输出示例
+
+```
+======================
+Parsing certificate: assests/cert_oneplus.bin
+======================
+[Native-TEE] Certificate parsed successfully!
+KeymasterSecurityLevel: 1
+device_locked: true
+verified_boot_key size: 32
+verified_boot_key (first 8 bytes): 9A B5 2B 33 38 C2 70 25
+verified_boot_state: 0
+OSVersion (TEE Enforced): 150000
+OSPatchLevel (TEE Enforced): 202503
+BootPatchLevel (TEE Enforced): 20250301
+======================
+```
 
 ## 项目链接
 
