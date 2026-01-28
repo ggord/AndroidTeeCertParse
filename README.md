@@ -43,18 +43,42 @@ go build -o AndroidTeeCertParse
 Parsing certificate: assests/cert_oneplus.bin
 ======================
 [Native-TEE] Certificate parsed successfully!
-KeymasterSecurityLevel: 1
-device_locked: true
-verified_boot_key size: 32
-verified_boot_key (first 8 bytes): 9A B5 2B 33 38 C2 70 25
-verified_boot_state: 0
-OSVersion (TEE Enforced): 150000
-OSPatchLevel (TEE Enforced): 202503
-BootPatchLevel (TEE Enforced): 20250301
+
+--- Certificate Information ---
+Subject:
+  CN (Common Name): Android Keystore Key
+Issuer:
+  CN (Common Name): Android Keystore Software Attestation Intermediate
+  O (Organization): Google, Inc.
+  OU (Organizational Unit): Android
+  C (Country): US
+  ST (State): California
+Validity:
+  Not Before: 700101000000Z
+  Not After:  480101000000Z
+Serial Number: 01
+Public Key: EC (P-256) (256 bits)
+
+--- TEE Attestation Extension ---
+Attestation Version: 300
+Attestation Security Level: 1 (TEE)
+Keymaster Version: 300
+Keymaster Security Level: 1 (TEE)
+
+--- Root of Trust ---
+Device Locked: true
+Verified Boot State: 0 (Verified)
+Verified Boot Key Size: 32 bytes
+Verified Boot Key (first 8 bytes): 9A B5 2B 33 38 C2 70 25
+
+--- TEE Enforced ---
+OS Version: 150000
+OS Patch Level: 202503
+Boot Patch Level: 20250301
 ======================
 ```
 
-#### 十六进制字符串解析输出
+#### 十六进制字符串解析输出（证书链完整信息）
 
 ```
 ======================
@@ -63,20 +87,89 @@ Parsing certificate from hex string
 
 --- Certificate #1 (offset: 0, size: 655 bytes) ---
 [Native-TEE] Certificate parsed successfully!
-[Native-TEE] Note: This is a standard X.509 certificate without TEE attestation extension (likely root/intermediate certificate)
+
+--- Certificate Information ---
+Subject:
+  CN (Common Name): Android Keystore Software Attestation Root
+  O (Organization): Google, Inc.
+  OU (Organizational Unit): Android
+  C (Country): US
+  ST (State): California
+  L (Locality): Mountain View
+Issuer:
+  CN (Common Name): Android Keystore Software Attestation Root
+  O (Organization): Google, Inc.
+  OU (Organizational Unit): Android
+  C (Country): US
+  ST (State): California
+  L (Locality): Mountain View
+Validity:
+  Not Before: 160111004350Z
+  Not After:  360106004350Z
+Serial Number: 00:A2:05:9E:D1:0E:43:5B:57
+Public Key: EC (P-256) (256 bits)
+
+--- TEE Attestation Extension ---
+Not present (standard X.509 certificate - likely root or intermediate CA)
 
 --- Certificate #2 (offset: 655, size: 636 bytes) ---
 [Native-TEE] Certificate parsed successfully!
-[Native-TEE] Note: This is a standard X.509 certificate without TEE attestation extension (likely root/intermediate certificate)
+
+--- Certificate Information ---
+Subject:
+  CN (Common Name): Android Keystore Software Attestation Intermediate
+  O (Organization): Google, Inc.
+  OU (Organizational Unit): Android
+  C (Country): US
+  ST (State): California
+Issuer:
+  CN (Common Name): Android Keystore Software Attestation Root
+  O (Organization): Google, Inc.
+  OU (Organizational Unit): Android
+  C (Country): US
+  ST (State): California
+  L (Locality): Mountain View
+Validity:
+  Not Before: 160111004609Z
+  Not After:  260108004609Z
+Serial Number: 10:01
+Public Key: EC (P-256) (256 bits)
+
+--- TEE Attestation Extension ---
+Not present (standard X.509 certificate - likely root or intermediate CA)
 
 --- Certificate #3 (offset: 1291, size: 692 bytes) ---
 [Native-TEE] Certificate parsed successfully!
-KeymasterSecurityLevel: 0
-device_locked: false
-verified_boot_key size: 0
-verified_boot_state: 0
-OSVersion (Software Enforced): 90000
-OSPatchLevel (Software Enforced): 201907
+
+--- Certificate Information ---
+Subject:
+  CN (Common Name): Android Keystore Key
+Issuer:
+  CN (Common Name): Android Keystore Software Attestation Intermediate
+  O (Organization): Google, Inc.
+  OU (Organizational Unit): Android
+  C (Country): US
+  ST (State): California
+Validity:
+  Not Before: 700101000000Z
+  Not After:  21060207062815Z
+Serial Number: 01
+Public Key: EC (P-256) (256 bits)
+
+--- TEE Attestation Extension ---
+Attestation Version: 2
+Attestation Security Level: 0 (Software)
+Keymaster Version: 3
+Keymaster Security Level: 0 (Software)
+
+--- Root of Trust ---
+Device Locked: false
+Verified Boot State: 0 (Verified)
+Verified Boot Key Size: 0 bytes
+
+--- Software Enforced ---
+OS Version: 90000
+OS Patch Level: 201907
 ```
 
 ## 项目链接
