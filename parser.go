@@ -25,7 +25,7 @@ func NewTeeCert(data []byte) (*TeeCert, error) {
 	// Parse X.509 certificate
 	x509Cert, err := parseX509Certificate(data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse X.509 certificate: %v", err)
+		return nil, fmt.Errorf("failed to parse certificate data: %v", err)
 	}
 	cert.X509Cert = x509Cert
 
@@ -209,6 +209,11 @@ func parseTEEAttestationExtension(data []byte, offset int) (*TEEAttestationExten
 }
 
 // parseAttestationRecord parses the attestation record
+// Note: This parser relies on the fixed order of fields in the attestation record SEQUENCE.
+// According to the Android Key Attestation specification, the fields appear in this order:
+// 0: attestationVersion, 1: attestationSecurityLevel, 2: keymasterVersion,
+// 3: keymasterSecurityLevel, 4: attestationChallenge, 5: uniqueId,
+// 6: softwareEnforced, 7: teeEnforced
 func parseAttestationRecord(data []byte, offset int, length int) (*AttestationRecord, error) {
 	record := &AttestationRecord{}
 
